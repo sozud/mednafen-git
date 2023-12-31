@@ -463,6 +463,12 @@ template<typename T, bool IsWrite, bool Access24> static INLINE void MemRW(pscpu
   printf("Read%d: %08x(orig=%08x)\n", (int)(sizeof(T) * 8), A & mask[A >> 29], A);
  #endif
 
+ // pcsx exit
+ if(IsWrite && A == 0x1f802082)
+ {
+  exit(V);
+ }
+
  if(!IsWrite)
   timestamp += DMACycleSteal;
 
@@ -1588,7 +1594,7 @@ static MDFN_COLD void InitCommon(std::vector<CDInterface*> *CDInterfaces, const 
  bool correct_aspect;
 
 #if PSX_DBGPRINT_ENABLE
- psx_dbg_level = MDFN_GetSettingUI("psx.dbg_level");
+ psx_dbg_level = 2;
 #endif
 
  cdifs = CDInterfaces;
