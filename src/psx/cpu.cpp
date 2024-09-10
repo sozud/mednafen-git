@@ -23,7 +23,11 @@
 
 #include "psx.h"
 #include "cpu.h"
-
+#include <ostream>
+#include <iostream>
+#include <fstream>
+#include <set>
+#include <iomanip>
 #if 0
  #define EXP_ILL_CHECK(n) {n;}
 #else
@@ -594,6 +598,54 @@ uint32 NO_INLINE PS_CPU::Exception(uint32 code, uint32 PC, const uint32 NP, cons
 #define GPR_RES(n) { unsigned tn = (n); ReadAbsorb[tn] = 0; }
 #define GPR_DEPRES_END ReadAbsorb[0] = back; }
 
+
+int times = 0;
+std::set<uint32_t> mySet;
+bool start = false;
+void AddLoc(uint32_t pc)
+{
+	if(pc == 0x800DAE8C)
+	{
+		start = true;
+	}
+
+	if(!start)
+	{
+		return;
+	}
+	// if((pc > 0x80010000) && (pc <= 0x9fffffff))
+	// {
+
+	// }
+	// else {
+	// 	return;
+	// }
+	mySet.insert(pc);
+
+	times++;
+
+	if(times%100000 == 0)
+	{
+		std::ofstream outFile("output.txt");
+
+		if (!outFile.is_open()) {
+			std::cerr << "Failed to open file!" << std::endl;
+			exit(1);
+		}
+
+		// Write sorted keys to the file
+		for (const int& key : mySet) {
+			// outFile << key << std::endl;
+			outFile << std::hex << std::setw(8) << std::setfill('0') 
+					<< key << std::endl;
+
+		}
+
+		// Close the file
+		outFile.close();
+	}
+}
+
 template<bool DebugMode, bool BIOSPrintMode, bool ILHMode>
 pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 {
@@ -719,6 +771,8 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 	  new_PC = ((new_PC - 4) & mask) + offset;		\
 	  BDBT = 3;						\
 								\
+								\
+		AddLoc(new_PC);					\
           if(DebugMode && ADDBT)                 		\
 	  {							\
            ADDBT(PC, new_PC, false);				\
