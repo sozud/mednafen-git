@@ -599,11 +599,13 @@ uint32 NO_INLINE PS_CPU::Exception(uint32 code, uint32 PC, const uint32 NP, cons
 #define GPR_DEPRES_END ReadAbsorb[0] = back; }
 
 
-int times = 0;
-std::set<uint32_t> mySet;
-bool start = false;
+
 void AddLoc(uint32_t pc)
 {
+static int times = 0;
+static std::set<uint32_t> mySet;
+static std::vector<uint32_t> list;
+static bool start = false;
 	if(pc == 0x800DAE8C)
 	{
 		start = true;
@@ -613,14 +615,11 @@ void AddLoc(uint32_t pc)
 	{
 		return;
 	}
-	// if((pc > 0x80010000) && (pc <= 0x9fffffff))
-	// {
 
-	// }
-	// else {
-	// 	return;
-	// }
-	mySet.insert(pc);
+	if (mySet.find(pc) == mySet.end()) {
+		list.push_back(pc);
+		mySet.insert(pc);
+	}
 
 	times++;
 
@@ -634,15 +633,149 @@ void AddLoc(uint32_t pc)
 		}
 
 		// Write sorted keys to the file
-		for (const int& key : mySet) {
-			// outFile << key << std::endl;
+		// for (const int& key : mySet) {
+		// 	// outFile << key << std::endl;
+		// 	outFile << std::hex << std::setw(8) << std::setfill('0') 
+		// 			<< key << std::endl;
+
+		// }
+
+		for(auto & key : list)
+		{
 			outFile << std::hex << std::setw(8) << std::setfill('0') 
 					<< key << std::endl;
-
 		}
 
 		// Close the file
 		outFile.close();
+	}
+}
+
+uint32_t checkit_pc = 0;
+void CheckIt(uint32_t pc, uint32_t a0)
+{
+	checkit_pc = pc;
+}
+
+// glabel g_MakeObjectFuncs                                     start_addr  size  num
+//     /* E4BA8 800F43A8 74AB0280 */ .word find_free_game_obj   0x8013BED0  0x9C  0x30
+//     /* E4BAC 800F43AC 0CAC0280 */ .word func_8002AC0C        0x801406F8  0x9C  0x10
+//     /* E4BB0 800F43B0 3CAD0280 */ .word func_8002AD3C        0x8013E510  0x70  0x20
+//     /* E4BB4 800F43B4 7CAD0280 */ .word find_free_effect_obj 0x80142F98  0x30  0x20
+//     /* E4BB8 800F43B8 BCAD0280 */ .word func_8002ADBC        0x80165A30  0x8C  0x20
+//     /* E4BBC 800F43BC 50AE0280 */ .word find_free_misc_obj   0x80173CA0  0x60  0x40
+//     /* E4BC0 800F43C0 08B00280 */ .word func_8002B008        0x801435B0  0x60  0x20
+//     /* E4BC4 800F43C4 48B00280 */ .word func_8002B048        0x80169CB8  0x30  0x04
+// .size g_MakeObjectFuncs, . - g_MakeObjectFuncs
+
+struct ObjectAddr {
+	uint32_t start_addr;
+	uint32_t size;
+	uint32_t num;
+};
+void AfterCheckIt(uint32_t pc, uint32_t a0)
+{
+	if(pc == checkit_pc)
+	{
+		static std::vector<ObjectAddr> objectAddrs = {
+			{0x8013BED0,  0x9C, 0x30},
+			{0x801406F8,  0x9C,  0x10},
+			{0x8013E510,  0x70,  0x20},
+			{0x80142F98,  0x30,  0x20},
+			{0x80165A30,  0x8C,  0x20},
+			{0x80173CA0,  0x60,  0x40},
+			{0x801435B0,  0x60,  0x20},
+			{0x80169CB8,  0x30,  0x04}
+		};
+		static std::vector<std::set<uint32_t>> objectSets(8);
+		static int times = 0;
+		// static std::set<uint32_t> mySet;
+		static std::vector<std::vector<uint32_t>> objectLists(8);
+		static bool start = false;
+
+		for(int objType = 0; objType < 8; objType++)
+		{
+			uint32_t start_addr = objectAddrs[objType].start_addr;
+			bool found = false;
+			for(int i = 0; i < objectAddrs[objType].num; i++)
+			{
+				if(a0 == start_addr + i * objectAddrs[objType].size)
+				{
+					found = true;
+				}
+			}
+
+			if (found && objectSets[objType].find(pc) == objectSets[objType].end()) {
+				objectLists[objType].push_back(pc);
+				objectSets[objType].insert(pc);
+			}
+		}
+
+			// #if 1
+			// uint32_t start_addr = 0x8013bed0;
+			// bool found = false;
+			// for(int i = 0; i < 0x30; i++)
+			// {
+			// 	if(a0 == start_addr + i * 0x9c)
+			// 	{
+			// 		found = true;
+			// 	}
+			// }
+			// #else 
+			// bool found = false;
+			// uint32_t start_addr = 0x801721c0; // Main game 
+
+			// if (a0 == start_addr)
+			// {
+			// 	found = true;
+			// }
+			// #endif
+
+			// if(pc == 0x800DAE8C)
+			// {
+			// 	start = true;
+			// }
+
+			// if(!start)
+			// {
+			// 	return;
+			// }
+
+
+			times++;
+
+			if(times%100000 == 0)
+			{
+				std::ofstream outFile("matching.txt");
+
+				if (!outFile.is_open()) {
+					std::cerr << "Failed to open file!" << std::endl;
+					exit(1);
+				}
+
+				// Write sorted keys to the file
+				// for (const int& key : mySet) {
+				// 	// outFile << key << std::endl;
+				// 	outFile << std::hex << std::setw(8) << std::setfill('0') 
+				// 			<< key << std::endl;
+
+				// }
+
+				for(int objType = 0; objType < 8; objType++)
+				{
+					outFile << "objType " << objType << std::endl;
+
+					for(auto & key : objectLists[objType])
+					{
+						outFile << std::hex << std::setw(8) << std::setfill('0') 
+								<< key << std::endl;
+					}
+					outFile << std::endl;
+				}
+
+				// Close the file
+				outFile.close();
+			}
 	}
 }
 
@@ -716,6 +849,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
    instr = ReadInstruction(timestamp, PC);
 
+   AfterCheckIt(PC, GPR[4]);
 
    // 
    // Instruction decode
@@ -736,7 +870,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
    #define BEGIN_OPF(name) { op_##name:
    #define END_OPF goto OpDone; }
 
-   #define DO_BRANCH(arg_cond, arg_offset, arg_mask, arg_dolink, arg_linkreg)\
+   #define DO_BRANCH(arg_cond, arg_offset, arg_mask, arg_dolink, arg_linkreg, do_log)\
 	{							\
 	 const bool cond = (arg_cond);				\
 	 const uint32 offset = (arg_offset);			\
@@ -773,6 +907,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 								\
 								\
 		AddLoc(new_PC);					\
+		if(do_log) {CheckIt(new_PC, GPR[4]);}\
           if(DebugMode && ADDBT)                 		\
 	  {							\
            ADDBT(PC, new_PC, false);				\
@@ -1000,7 +1135,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+	DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
     END_OPF;
 
     // Bah, why does MIPS encoding have to be funky like this. :(
@@ -1019,7 +1154,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(result, (immediate << 2), ~0U, true, link);
+	DO_BRANCH(result, (immediate << 2), ~0U, true, link, false);
     END_OPF;
 
 
@@ -1037,7 +1172,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+	DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
     END_OPF;
 
     //
@@ -1054,7 +1189,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+	DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
     END_OPF;
 
     //
@@ -1072,7 +1207,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+	DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
     END_OPF;
 
     //
@@ -1204,7 +1339,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 		 PSX_DBG(PSX_DBG_WARNING, "[CPU] BC0x instruction(0x%08x) @ PC=0x%08x\n", instr, PC);
 
-		 DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+		 DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
 		}
 		break;
 
@@ -1312,7 +1447,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 		 PSX_DBG(PSX_DBG_WARNING, "[CPU] BC2x instruction(0x%08x) @ PC=0x%08x\n", instr, PC);
 
-		 DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+		 DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
 		}
 		break;
 
@@ -1348,7 +1483,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 	  const uint32 immediate = (int32)(int16)(instr & 0xFFFF);
 	  const bool result = (false == (bool)(instr & (1U << 16)));
 
-	  DO_BRANCH(result, (immediate << 2), ~0U, false, 0);
+	  DO_BRANCH(result, (immediate << 2), ~0U, false, 0, false);
 	 }
 	}
     END_OPF;
@@ -1527,7 +1662,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(true, target << 2, 0xF0000000, false, 0);
+	DO_BRANCH(true, target << 2, 0xF0000000, false, 0, false);
     END_OPF;
 
     //
@@ -1542,7 +1677,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(true, target << 2, 0xF0000000, true, 31);
+	DO_BRANCH(true, target << 2, 0xF0000000, true, 31, true);
     END_OPF;
 
     //
@@ -1560,7 +1695,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(true, tmp, 0, true, rd);
+	DO_BRANCH(true, tmp, 0, true, rd, true);
     END_OPF;
 
     //
@@ -1578,7 +1713,7 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
 	DO_LDS();
 
-	DO_BRANCH(true, bt, 0, false, 0);
+	DO_BRANCH(true, bt, 0, false, 0, false);
     END_OPF;
 
     //
@@ -2475,7 +2610,6 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
    BDBT = 0;
 
    SkipNPCStuff:	;
-
    //printf("\n");
   }
  } while(MDFN_LIKELY(PSX_EventHandler(timestamp)));
