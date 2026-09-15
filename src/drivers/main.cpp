@@ -40,6 +40,7 @@
 #endif
 
 #include <atomic>
+#include <unordered_map>
 
 #include "input.h"
 #include "Joystick.h"
@@ -63,6 +64,256 @@
 #include <mednafen/string/string.h>
 #include <mednafen/file.h>
 #include <mednafen/AtomicFIFO.h>
+#include <mednafen/debug.h>
+#include <mednafen/psx/psx.h>
+
+static const uint32 MMX4_ARCHIVE_DESTINATION = 0x80173C80U;
+static const uint32 MMX4_ARCHIVE_BUFFER = 0x80178000U;
+static const uint32 MMX4_ENGINE_OBJ = 0x801721C0U;
+static const uint32 MMX4_ENGINE_STAGE = 0x801721CCU;
+static const uint32 MMX4_ENGINE_SUBSTAGE = 0x801721CDU;
+static const uint32 MMX4_ENGINE_CHECKPOINT = 0x801721DDU;
+static const uint32 MMX4_ENGINE_CHARACTER = 0x80172203U;
+static const uint32 MMX4_FUNC_LOAD_PLAYER_ARCHIVES = 0x80012EB8U;
+static const uint32 MMX4_FUNC_LOAD_SCENE_ARCHIVE = 0x80013014U;
+static const uint32 MMX4_FUNC_COPY_STAGE_DATA = 0x800160ACU;
+static const uint32 MMX4_FUNC_MOVIE_0 = 0x80018000U;
+static const uint32 MMX4_FUNC_MOVIE_1 = 0x800182E8U;
+static const uint32 MMX4_FUNC_MAIN = 0x8001DAF8U;
+static const uint32 MMX4_FUNC_ENGINE_DISPATCH = 0x8001FB50U;
+static const uint32 MMX4_FUNC_ENGINE_STATE_0 = 0x8001FBB8U;
+static const uint32 MMX4_FUNC_RESET_GAME_ENGINE = 0x8002A6FCU;
+static const uint32 MMX4_DIRECT_BOOT_RETURN = 0x801FFF00U;
+static const uint32 MMX4_FUNC_FRAME_BOUNDARY = 0x8001211CU;
+
+static const RegGroupType* mmx4_cpu_regs;
+static unsigned mmx4_boot_frames;
+static bool mmx4_fast_boot;
+static bool mmx4_fast_boot_ending;
+static bool mmx4_direct_applied;
+static unsigned mmx4_direct_phase;
+static uint8 mmx4_direct_stage;
+static uint8 mmx4_direct_substage;
+static uint8 mmx4_direct_checkpoint;
+static uint8 mmx4_direct_character;
+
+struct MMX4TraceFunction
+{
+ std::string name;
+ std::string source;
+ uint64 hits;
+};
+
+static std::unordered_map<uint32, MMX4TraceFunction> mmx4_trace_functions;
+static FILE* mmx4_trace_output;
+static uint64 mmx4_trace_sequence;
+static bool mmx4_trace_enabled;
+static bool mmx4_trace_started;
+
+static void MMX4CloseFunctionTrace(void)
+{
+ if(mmx4_trace_output)
+ {
+  std::fclose(mmx4_trace_output);
+  mmx4_trace_output = nullptr;
+ }
+}
+
+static void MMX4LoadFunctionTrace(void)
+{
+ const char* symbols_path = getenv("MMX4_FUNCTION_TRACE_SYMBOLS");
+ const char* output_path = getenv("MMX4_FUNCTION_TRACE_OUTPUT");
+ if(!symbols_path || !*symbols_path || !output_path || !*output_path)
+  return;
+
+ FILE* symbols = std::fopen(symbols_path, "r");
+ if(!symbols)
+  throw MDFN_Error(errno, "MMX4 function trace: unable to open symbol list");
+ char line[4096];
+ while(std::fgets(line, sizeof(line), symbols))
+ {
+  unsigned address;
+  char name[512];
+  char source[3072];
+  if(std::sscanf(line, "%x\t%511[^\t]\t%3071[^\n]", &address, name, source) == 3)
+   mmx4_trace_functions.emplace(address, MMX4TraceFunction { name, source, 0 });
+ }
+ std::fclose(symbols);
+ if(mmx4_trace_functions.empty())
+  throw MDFN_Error(0, "MMX4 function trace: symbol list is empty");
+
+ mmx4_trace_output = std::fopen(output_path, "wx");
+ if(!mmx4_trace_output)
+  throw MDFN_Error(errno, "MMX4 function trace: unable to create output");
+ std::fprintf(mmx4_trace_output, "sequence\taddress\tname\tsource\n");
+ std::fflush(mmx4_trace_output);
+ std::atexit(MMX4CloseFunctionTrace);
+ mmx4_trace_enabled = true;
+ MDFN_printf("MMX4 function trace: watching %zu entries\n", mmx4_trace_functions.size());
+}
+
+static void MMX4Poke8(uint32 address, uint8 value)
+{
+ MDFN_IEN_PSX::PSX_MemPoke8(address & 0x1FFFFFFF, value);
+}
+
+static void MMX4Poke32(uint32 address, uint32 value)
+{
+ MDFN_IEN_PSX::PSX_MemPoke32(address & 0x1FFFFFFF, value);
+}
+
+static uint8 MMX4EnvU8(const char* name, uint8 fallback)
+{
+ const char* value = getenv(name);
+ if(!value || !*value)
+  return fallback;
+ const unsigned long parsed = strtoul(value, nullptr, 0);
+ return parsed <= 0xFF ? uint8(parsed) : fallback;
+}
+
+static uint8 MMX4Peek8(uint32 address)
+{
+ return uint8(MDFN_IEN_PSX::PSX_DBGInfo.MemPeek(address, 1, true, true));
+}
+
+static void MMX4DirectCall(uint32 function)
+{
+ mmx4_cpu_regs->SetRegister(31, MMX4_DIRECT_BOOT_RETURN);
+ mmx4_cpu_regs->SetRegister(32, function);
+ mmx4_cpu_regs->SetRegister(33, function + 4);
+}
+
+static void MMX4ApplyDirectBoot(void)
+{
+ uint8 engine[0x64] = {};
+ if(!getenv("MMX4_INPUT_PLAY"))
+ {
+  mmx4_direct_stage = MMX4EnvU8("MMX4_DIRECT_STAGE", 0);
+  mmx4_direct_substage = MMX4EnvU8("MMX4_DIRECT_SUBSTAGE", 0);
+  mmx4_direct_checkpoint = MMX4EnvU8("MMX4_DIRECT_CHECKPOINT", 0);
+  mmx4_direct_character = MMX4EnvU8("MMX4_DIRECT_CHARACTER", 0);
+ }
+ engine[0x0C] = 0xE;
+ engine[0x0D] = 0;
+ engine[0x43] = mmx4_direct_character;
+ for(unsigned i = 0; i < sizeof(engine); i++)
+  MMX4Poke8(MMX4_ENGINE_OBJ + i, engine[i]);
+ MMX4Poke32(MMX4_ARCHIVE_DESTINATION, MMX4_ARCHIVE_BUFFER);
+
+ mmx4_direct_phase = 1;
+ MMX4DirectCall(MMX4_FUNC_LOAD_SCENE_ARCHIVE);
+ mmx4_direct_applied = true;
+ MDFN_printf("MMX4 replay: direct booting stage %u-%u, checkpoint %u, character %u\n",
+             mmx4_direct_stage, mmx4_direct_substage,
+             mmx4_direct_checkpoint, mmx4_direct_character);
+}
+
+static void MMX4AdvanceDirectBoot(void)
+{
+ switch(mmx4_direct_phase++)
+ {
+  case 1: MMX4DirectCall(MMX4_FUNC_COPY_STAGE_DATA); break;
+  case 2:
+   MMX4Poke8(MMX4_ENGINE_SUBSTAGE, 1);
+   MMX4DirectCall(MMX4_FUNC_LOAD_SCENE_ARCHIVE);
+   break;
+  case 3: MMX4DirectCall(MMX4_FUNC_COPY_STAGE_DATA); break;
+  case 4: MMX4DirectCall(MMX4_FUNC_LOAD_PLAYER_ARCHIVES); break;
+  case 5: MMX4DirectCall(MMX4_FUNC_RESET_GAME_ENGINE); break;
+  case 6:
+   mmx4_cpu_regs->SetRegister(4, MMX4_ENGINE_OBJ);
+   MMX4DirectCall(MMX4_FUNC_ENGINE_STATE_0);
+   break;
+  default:
+   MMX4Poke8(MMX4_ENGINE_OBJ, 4);
+   MMX4Poke8(MMX4_ENGINE_STAGE, mmx4_direct_stage);
+   MMX4Poke8(MMX4_ENGINE_SUBSTAGE, mmx4_direct_substage);
+   MMX4Poke8(MMX4_ENGINE_CHECKPOINT, mmx4_direct_checkpoint);
+   MMX4Poke8(MMX4_ENGINE_CHARACTER, mmx4_direct_character);
+   mmx4_cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
+   mmx4_cpu_regs->SetRegister(33, MMX4_FUNC_ENGINE_DISPATCH + 4);
+   MDFN_printf("MMX4 replay: direct boot archives ready\n");
+   break;
+ }
+}
+
+static void MMX4DirectBootCPUHook(uint32 pc, bool)
+{
+ if(mmx4_trace_enabled && !mmx4_trace_started &&
+    MDFN_IEN_PSX::PSX_MemPeek8(MMX4_ENGINE_OBJ & 0x1FFFFFFF) == 6)
+ {
+  mmx4_trace_started = true;
+  MDFN_printf("MMX4 function trace: collection started at engine state 6\n");
+ }
+ auto traced = mmx4_trace_started ? mmx4_trace_functions.find(pc) : mmx4_trace_functions.end();
+ if(traced != mmx4_trace_functions.end())
+ {
+  MMX4TraceFunction& function = traced->second;
+  if(!function.hits++)
+  {
+   std::fprintf(mmx4_trace_output, "%llu\t%08x\t%s\t%s\n",
+                (unsigned long long)++mmx4_trace_sequence, pc,
+                function.name.c_str(), function.source.c_str());
+   std::fflush(mmx4_trace_output);
+  }
+ }
+ if(pc == MMX4_FUNC_MOVIE_0 || pc == MMX4_FUNC_MOVIE_1)
+ {
+  const uint32 ra = mmx4_cpu_regs->GetRegister(31, nullptr, 0);
+  mmx4_cpu_regs->SetRegister(32, ra);
+  mmx4_cpu_regs->SetRegister(33, ra + 4);
+ }
+ else if(pc == MMX4_FUNC_MAIN && !mmx4_direct_applied)
+  MMX4ApplyDirectBoot();
+ else if(pc == MMX4_DIRECT_BOOT_RETURN && mmx4_direct_applied)
+  MMX4AdvanceDirectBoot();
+ else if(pc == MMX4_FUNC_FRAME_BOUNDARY)
+ {
+  if(mmx4_fast_boot && !mmx4_fast_boot_ending &&
+     (MMX4Peek8(MMX4_ENGINE_OBJ) == 6 || mmx4_boot_frames > 6000))
+  {
+   mmx4_fast_boot_ending = true;
+   MDFN_printf("MMX4 fast boot: normal speed restored after %u frames\n",
+               mmx4_boot_frames);
+  }
+  mmx4_boot_frames++;
+ }
+ MDFN_IEN_PSX::PSX_DBGInfo.SetCPUCallback(MMX4DirectBootCPUHook, mmx4_trace_enabled);
+}
+
+static void MMX4InstallDirectBoot(void)
+{
+ if(!getenv("MMX4_ORACLE_DIRECT_BOOT") && !getenv("MMX4_INPUT_RECORD") &&
+    !getenv("MMX4_INPUT_PLAY"))
+  return;
+ if(!CurGame || strcmp(CurGame->shortname, "psx") || !CurGame->Debugger)
+  return;
+ MMX4LoadFunctionTrace();
+ if(const char* path = getenv("MMX4_INPUT_PLAY"))
+ {
+  uint8 scene[4];
+  MDFNI_MMX4LoadReplay(path, scene);
+  mmx4_direct_stage = scene[0];
+  mmx4_direct_substage = scene[1];
+  mmx4_direct_checkpoint = scene[2];
+  mmx4_direct_character = scene[3];
+ }
+ mmx4_direct_applied = false;
+ mmx4_direct_phase = 0;
+ mmx4_cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
+ for(uint32 pc : { MMX4_FUNC_MOVIE_0, MMX4_FUNC_MOVIE_1,
+                   MMX4_FUNC_MAIN, MMX4_DIRECT_BOOT_RETURN })
+  MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, pc, pc, true);
+ mmx4_fast_boot = getenv("MMX4_FAST_BOOT") && strtoul(getenv("MMX4_FAST_BOOT"), nullptr, 0);
+ if(mmx4_fast_boot)
+ {
+  MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, MMX4_FUNC_FRAME_BOUNDARY,
+                                          MMX4_FUNC_FRAME_BOUNDARY, true);
+  MDFN_printf("MMX4 fast boot: unthrottled, showing every eighth frame, "
+              "until the room is ready\n");
+ }
+ MDFN_IEN_PSX::PSX_DBGInfo.SetCPUCallback(MMX4DirectBootCPUHook, mmx4_trace_enabled);
+}
 
 static bool SuppressErrorPopups;	// Set from env variable "MEDNAFEN_NOPOPUPS"
 
@@ -164,7 +415,7 @@ static const MDFNSetting DriverSettings[] =
   { "netplay.console.scale", MDFNSF_NOFLAGS, gettext_noop("Netplay chat console text scale factor."), gettext_noop("A value of 0 enables auto-scaling."), MDFNST_UINT, "1", "0", "16" },
   { "netplay.console.lines", MDFNSF_NOFLAGS, gettext_noop("Height of chat console, in lines."), NULL, MDFNST_UINT, "5", "5", "64" },
 
-  { "video.frameskip", MDFNSF_NOFLAGS, gettext_noop("Enable frameskip during emulation rendering."), 
+  { "video.frameskip", MDFNSF_NOFLAGS, gettext_noop("Enable frameskip during emulation rendering."),
 					gettext_noop("Disable for rendering code performance testing."), MDFNST_BOOL, "1" },
 
   { "video.blit_timesync", MDFNSF_NOFLAGS, gettext_noop("Enable time synchronization(waiting) for frame blitting."),
@@ -211,9 +462,9 @@ static const MDFNSetting DriverSettings[] =
   { NULL }
 };
 
-void AddSystemSetting(const char *system_name, const char *name, const char *description, const char *description_extra, MDFNSettingType type, 
+void AddSystemSetting(const char *system_name, const char *name, const char *description, const char *description_extra, MDFNSettingType type,
 	const char *default_value, const char *minimum, const char *maximum,
-	bool (*validate_func)(const char *name, const char *value), void (*ChangeNotification)(const char *name), 
+	bool (*validate_func)(const char *name, const char *value), void (*ChangeNotification)(const char *name),
         const MDFNSetting_EnumList *enum_list, uint32 extra_flags)
 {
  char setting_name[256];
@@ -444,7 +695,7 @@ void Mednafen::MDFND_OutputNotice(MDFN_NoticeType t, const char* s) noexcept
  {
   if(StdoutMutex)
    MThreading::Mutex_Lock(StdoutMutex);
- 
+
   puts(s);
   fflush(stdout);
 
@@ -598,7 +849,7 @@ static SignalInfo SignalDefs[] =
  #ifdef SIGABRT
  { SIGABRT, "SIGABRT", gettext_noop("Abort, Retry, Ignore, Fail?\n"), NULL, FALSE },
  #endif
- 
+
  #ifdef SIGUSR1
  { SIGUSR1, "SIGUSR1", gettext_noop("Killing your processes is not nice.\n"), NULL, TRUE },
  #endif
@@ -890,7 +1141,7 @@ static bool DoArgs(int argc, char *argv[], char **filename)
 	int ss_midsync;
 	#endif
 
-        ARGPSTRUCT MDFNArgs[] = 
+        ARGPSTRUCT MDFNArgs[] =
 	{
 	 { "help", _("Show help!"), &ShowCLHelp, 0, 0 },
 
@@ -1149,6 +1400,7 @@ static int LoadGame(const char *force_module, const char *path)
 	ers.SetEmuClock(CurGame->MasterClock >> 32);
 
 	Debugger_Init();
+	MMX4InstallDirectBoot();
 
 	if(qtrecfn)
 	{
@@ -1284,7 +1536,7 @@ static int GameLoop(void *arg)
 	 int32 ssize;
 	 uint32 mcycs;
 	 bool fskip;
-        
+
 	 /* If we requested a new video mode, wait until it's set before calling the emulation code again.
 	 */
 	 while(NeedVideoSync)
@@ -1300,12 +1552,26 @@ static int GameLoop(void *arg)
 
 	 if(MDFNDnetplay && !(NoWaiting & 0x2))	// TODO: Hacky, clean up.
 	  ers.SetETtoRT();
+
+	 if(mmx4_fast_boot_ending)
+	 {
+	  mmx4_fast_boot_ending = false;
+	  mmx4_fast_boot = false;
+	  ers.SetETtoRT();
+	 }
 	 //
 	 //
 	 fskip = ers.NeedFrameSkip();
 	 fskip &= MDFN_GetSettingB("video.frameskip");
 	 fskip &= !(pending_ssnapshot || pending_snapshot || pending_save_state || pending_save_movie || NeedFrameAdvance);
 	 fskip |= (bool)NoWaiting;
+
+	 if(mmx4_fast_boot)
+	 {
+	  static unsigned mmx4_boot_blit_phase;
+
+	  fskip |= (++mmx4_boot_blit_phase & 7) != 0;
+	 }
 
 	 //printf("fskip %d; NeedFrameAdvance=%d\n", fskip, NeedFrameAdvance);
 
@@ -1376,6 +1642,13 @@ static int GameLoop(void *arg)
 	 }
 	 else
           MDFNI_Emulate(&espec);
+
+         if(MDFNI_MMX4ReplayFinished())
+         {
+          GameLoopPaused = true;
+          if(getenv("MMX4_REPLAY_EXIT"))
+           SendCEvent(CEVT_WANT_EXIT, nullptr, nullptr);
+         }
 
 	 if(MDFN_UNLIKELY(StateSLSTest))
 	 {
@@ -1463,7 +1736,7 @@ static int GameLoop(void *arg)
 	}
 
 	return 1;
-}   
+}
 
 
 std::string GetBaseDirectory(void)
@@ -1732,7 +2005,7 @@ void PumpWrap(void)
 	}
 	break;
 
-   default: 
+   default:
 	if(gtevents.CanWrite())
 	{
 	 gtevents.Write(event);
@@ -1874,7 +2147,7 @@ char *GetFileDialog(void)
 
  if(GetOpenFileName(&ofn))
   return(strdup(returned_fn));
- 
+
  return(NULL);
 }
 #endif
@@ -2376,7 +2649,7 @@ int main(int argc, char *argv[])
 	   char* env_aw = getenv("MEDNAFEN_ALLOWMULTI");
 
 	   if(env_aw && atoi(env_aw) != 0)
-	   {	
+	   {
 	    MDFN_printf(_("Error, but proceeding anyway per environment variable \"MEDNAFEN_ALLOWMULTI\".\n"));
 	   }
 	   else
@@ -2434,7 +2707,7 @@ int main(int argc, char *argv[])
 	 //
 
 	 /* Now the fun begins! */
-	 /* Run the video and event pumping in the main thread, and create a 
+	 /* Run the video and event pumping in the main thread, and create a
 	    secondary thread to run the game in(and do sound output, since we use
 	    separate sound code which should be thread safe(?)).
 	 */
@@ -2506,7 +2779,7 @@ static void UpdateSoundSync(int16 *Buffer, uint32 Count)
   const uint32 cw = Sound_CanWrite();
   bool NeedETtoRT = (Count >= (cw * 0.95));
 
-  if(NoWaiting && Count > cw)
+  if((NoWaiting || mmx4_fast_boot) && Count > cw)
   {
    //printf("NW C to M; count=%d, max=%d\n", Count, max);
    Count = cw;
@@ -2548,7 +2821,7 @@ static void UpdateSoundSync(int16 *Buffer, uint32 Count)
  {
   bool nothrottle = MDFN_GetSettingB("nothrottle");
 
-  if(!NoWaiting && !nothrottle && GameThreadRun && !MDFNDnetplay)
+  if(!NoWaiting && !mmx4_fast_boot && !nothrottle && GameThreadRun && !MDFNDnetplay)
    ers.Sync();
  }
 }
@@ -2593,7 +2866,8 @@ void Mednafen::MDFND_MidSync(EmulateSpecStruct *espec, const unsigned flags)
  if(flags & MIDSYNC_FLAG_UPDATE_INPUT)
  {
   GameThread_HandleEvents(); // Should be safe, but be careful about future changes.
-  Input_Update(true, false);
+  if(!getenv("MMX4_INPUT_RECORD") && !getenv("MMX4_INPUT_PLAY"))
+   Input_Update(true, false);
  }
  //else
  //{
@@ -2711,4 +2985,3 @@ void Mednafen::MDFND_SetMovieStatus(StateStatusStruct *status) noexcept
 {
  SendCEvent(CEVT_SET_MOVIE_STATUS, status, NULL);
 }
-

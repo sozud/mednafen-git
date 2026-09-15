@@ -53,6 +53,7 @@
 #include "tests.h"
 #include "video/tblur.h"
 #include "qtrecord.h"
+#include "psx/psx.h"
 
 namespace Mednafen
 {
@@ -104,7 +105,7 @@ static const MDFNSetting MednafenSettings[] =
   { "netplay.nick", MDFNSF_NOFLAGS, gettext_noop("Nickname."), gettext_noop("Nickname to use for network play chat."), MDFNST_STRING, "" },
   { "netplay.gamekey", MDFNSF_NOFLAGS, gettext_noop("Key to hash with the MD5 hash of the game."), NULL, MDFNST_STRING, "" },
 
-  { "srwframes", MDFNSF_NOFLAGS, gettext_noop("Number of frames to keep states for when state rewinding is enabled."), 
+  { "srwframes", MDFNSF_NOFLAGS, gettext_noop("Number of frames to keep states for when state rewinding is enabled."),
 	gettext_noop("Caution: Setting this to a large value may cause excessive RAM usage in some circumstances, such as with games that stream large volumes of data off of CDs."), MDFNST_UINT, "600", "10", "99999" },
 
   { "cd.image_memcache", MDFNSF_NOFLAGS, gettext_noop("Cache entire CD images in memory."), gettext_noop("Reads the entire CD image(s) into memory at startup(which will cause a small delay).  Can help obviate emulation hiccups due to emulated CD access.  May cause more harm than good on low memory systems, systems with swap enabled, and/or when the disc images in question are on a fast SSD.\n\nCaution: When using a 32-bit build of Mednafen on Windows or a 32-bit operating system, Mednafen may run out of address space(and error out, possibly in the middle of emulation) if this option is enabled when loading large disc sets(e.g. 3+ discs) via M3U files."), MDFNST_BOOL, "0" },
@@ -276,6 +277,145 @@ static uint32 PortDevice[16];
 static uint8* PortData[16];
 static uint32 PortDataLen[16];
 
+static FILE* mmx4_replay_file;
+static bool mmx4_replay_open_attempted;
+static uint64 mmx4_replay_frames;
+static FILE* mmx4_play_file;
+static uint8 mmx4_play_scene[4];
+static uint64 mmx4_play_frames;
+static uint64 mmx4_play_length;
+static bool mmx4_play_started;
+
+void MDFNI_MMX4LoadReplay(const char* path, uint8* scene)
+{
+ if(getenv("MMX4_INPUT_RECORD"))
+  throw MDFN_Error(0, "MMX4 replay: recording and playback cannot run together");
+ FileStream file(path, FileStream::MODE_READ);
+ uint8 header[16];
+ const uint64 size = file.size();
+ if(size < 18 || (size - 16) % 2)
+  throw MDFN_Error(0, "MMX4 replay: empty or truncated input stream");
+ file.read(header, sizeof(header));
+ if(memcmp(header, "MMX4RPL1", 8) || header[12] || header[13] || header[14] || header[15])
+  throw MDFN_Error(0, "MMX4 replay: invalid or unsupported header");
+ mmx4_play_file = fopen(path, "rb");
+ if(!mmx4_play_file || fseek(mmx4_play_file, 16, SEEK_SET))
+  throw MDFN_Error(errno, "MMX4 replay: unable to open input stream");
+ memcpy(scene, header + 8, 4);
+ memcpy(mmx4_play_scene, scene, 4);
+ mmx4_play_frames = 0;
+ mmx4_play_length = (size - 16) / 2;
+ mmx4_play_started = false;
+ MDFN_printf("MMX4 replay: loaded %llu frames from %s\n",
+             (unsigned long long)mmx4_play_length, path);
+}
+
+bool MDFNI_MMX4ReplayFinished(void)
+{
+ return mmx4_play_file && mmx4_play_frames == mmx4_play_length;
+}
+
+
+static void MMX4PlaybackInput(void)
+{
+ if(!mmx4_play_file)
+  return;
+ if(PortDataLen[0] < 2)
+  throw MDFN_Error(0, "MMX4 replay: port 1 needs a PSX gamepad");
+ memset(PortData[0], 0, PortDataLen[0]);
+ if(MDFNI_MMX4ReplayFinished())
+  return;
+ if(!mmx4_play_started)
+ {
+  if(MDFN_IEN_PSX::PSX_MemPeek8(0x001721C0U) != 6 ||
+     MDFN_IEN_PSX::PSX_MemPeek8(0x001721CCU) != mmx4_play_scene[0] ||
+     MDFN_IEN_PSX::PSX_MemPeek8(0x001721CDU) != mmx4_play_scene[1])
+   return;
+  mmx4_play_started = true;
+  MDFN_printf("MMX4 replay: playback started at stage %u-%u (engine state 6)\n",
+              mmx4_play_scene[0], mmx4_play_scene[1]);
+ }
+ uint8 input[2];
+ if(fread(input, sizeof(input), 1, mmx4_play_file) != 1)
+  throw MDFN_Error(0, "MMX4 replay: input stream ended unexpectedly");
+ // Invert the recorder's wire-order to Psy-Q byte swap.
+ PortData[0][0] = input[1];
+ PortData[0][1] = input[0];
+ if(++mmx4_play_frames == mmx4_play_length)
+ {
+  MDFN_printf("MMX4 replay: playback finished after %llu frames\n",
+              (unsigned long long)mmx4_play_frames);
+  MDFN_Notify(MDFN_NOTICE_STATUS, "Replay finished. Press Escape to quit.");
+ }
+}
+
+static uint16 MMX4ConvertGamepad(uint16 input)
+{
+ return uint16((input << 8) | (input >> 8));
+}
+
+static void MMX4RecordInput(void)
+{
+ const char* path = getenv("MMX4_INPUT_RECORD");
+ if(!path || !*path || strcmp(MDFNGameInfo->shortname, "psx") ||
+    PortDataLen[0] < 2)
+  return;
+
+ const uint8 state = MDFN_IEN_PSX::PSX_MemPeek8(0x001721C0U);
+ if(!mmx4_replay_file)
+ {
+  if(mmx4_replay_open_attempted || state != 6)
+   return;
+  mmx4_replay_open_attempted = true;
+  mmx4_replay_file = fopen(path, "wbx");
+  if(!mmx4_replay_file)
+  {
+   MDFN_Notify(MDFN_NOTICE_ERROR, "MMX4 replay: unable to create %s", path);
+   return;
+  }
+  uint8 header[16] = { 'M', 'M', 'X', '4', 'R', 'P', 'L', '1' };
+  header[8] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721CCU);
+  header[9] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721CDU);
+  header[10] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721DDU);
+  header[11] = MDFN_IEN_PSX::PSX_MemPeek8(0x00172203U);
+  if(fwrite(header, sizeof(header), 1, mmx4_replay_file) != 1)
+   throw MDFN_Error(errno, "MMX4 replay: unable to write header");
+  MDFN_printf("MMX4 replay: recording started at stage %u-%u (engine state 6)\n",
+              header[8], header[9]);
+  MDFN_Notify(MDFN_NOTICE_STATUS, "MMX4 replay recording started: %s", path);
+ }
+
+ const uint16 raw = uint16(PortData[0][0]) | (uint16(PortData[0][1]) << 8);
+ const uint16 input = MMX4ConvertGamepad(raw);
+ if(fputc(input & 0xFF, mmx4_replay_file) == EOF ||
+    fputc(input >> 8, mmx4_replay_file) == EOF)
+  throw MDFN_Error(errno, "MMX4 replay: unable to write input");
+ mmx4_replay_frames++;
+ if(!(mmx4_replay_frames % 60) && fflush(mmx4_replay_file))
+  throw MDFN_Error(errno, "MMX4 replay: unable to flush input");
+}
+
+static void MMX4CloseReplay(void)
+{
+ if(mmx4_play_file)
+ {
+  fclose(mmx4_play_file);
+  mmx4_play_file = nullptr;
+ }
+ mmx4_play_frames = mmx4_play_length = 0;
+ mmx4_play_started = false;
+ if(mmx4_replay_file)
+ {
+  if(fclose(mmx4_replay_file))
+   MDFN_Notify(MDFN_NOTICE_ERROR, "MMX4 replay: error closing recording");
+  mmx4_replay_file = nullptr;
+  MDFN_printf("MMX4 replay: recorded %llu frames\n",
+              (unsigned long long)mmx4_replay_frames);
+ }
+ mmx4_replay_open_attempted = false;
+ mmx4_replay_frames = 0;
+}
+
 MDFNGI* MDFNGameInfo = NULL;
 
 static QTRecord *qtrecorder = NULL;
@@ -293,7 +433,7 @@ static std::vector<CDInterface *> CDInterfaces;
 
 struct DriveMediaStatus
 {
- uint32 state_idx = 0; 
+ uint32 state_idx = 0;
  uint32 media_idx = 0;
  uint32 orientation_idx = 0;
 };
@@ -454,6 +594,7 @@ static MDFN_COLD void Cleanup(void)
 
 void MDFNI_CloseGame(void)
 {
+ MMX4CloseReplay();
  if(MDFNGameInfo)
  {
   MDFNI_NetplayDisconnect();
@@ -880,7 +1021,7 @@ static MDFN_COLD void LoadCustomPalette(VirtualFS* vfs)
    {
     std::unique_ptr<Stream> fp(vfs->open(cpal_path, VirtualFS::MODE_READ));
     const uint64 fpsz = fp->size();
-   
+
     for(auto vec = cpi->valid_entry_count; *vec; vec++)
     {
      if(fpsz == *vec * 3)
@@ -993,7 +1134,7 @@ static MDFN_COLD void LoadCommonPost(const std::string& fbase_name, GameFile* gf
 	MDFNI_SetLayerEnableMask(~0ULL);
 
 	#ifdef WANT_DEBUGGER
-	MDFNDBG_PostGameLoad(); 
+	MDFNDBG_PostGameLoad();
 	#endif
 
 	MDFNSS_CheckStates();
@@ -1067,7 +1208,7 @@ static MDFN_COLD const MDFNGI* FindCompatibleModule(const char* force_module, Ga
    if(!MDFN_GetSettingB(tmpstr))
    {
     MDFN_printf(_("Skipping module \"%s\" per \"%s\" setting.\n"), gi->shortname, tmpstr);
-    continue; 
+    continue;
    }
 
    if(gf)
@@ -1657,7 +1798,7 @@ bool MDFNI_SaveSettings(const char* path)
  {
   MDFN_Notify(MDFN_NOTICE_ERROR, "%s", e.what());
   return false;
- } 
+ }
  return true;
 }
 
@@ -1712,7 +1853,7 @@ static void ProcessAudio(EmulateSpecStruct *espec)
 
    if(MDFNGameInfo->soundchan == 1)
    {
-    for(int x = 0; x < (slen / 2); x++)    
+    for(int x = 0; x < (slen / 2); x++)
     {
      int16 cha = yaybuf[slen - x - 1];
      yaybuf[slen - x - 1] = yaybuf[x];
@@ -1783,7 +1924,7 @@ static void ProcessAudio(EmulateSpecStruct *espec)
       ff_resampler.buffer()[i * 2] = SoundBuf[i];
       ff_resampler.buffer()[i * 2 + 1] = 0;
      }
-    }   
+    }
     ff_resampler.write(SoundBufSize * 2);
 
     int avail = ff_resampler.avail();
@@ -1935,6 +2076,9 @@ void MDFNI_Emulate(EmulateSpecStruct *espec)
  Netplay_Update(PortDevice, PortData, PortDataLen);
 
  MDFNMOV_ProcessInput(PortData, PortDataLen, MDFNGameInfo->PortInfo.size());
+
+ MMX4PlaybackInput();
+ MMX4RecordInput();
 
  if(qtrecorder)
   espec->skip = 0;
@@ -2186,7 +2330,7 @@ void MDFN_printf(const char *format, ...) noexcept
  }
 
  format_temp = (char *)malloc(newlen + 1); // Length + NULL character, duh
- 
+
  // Now, construct our format_temp string
  lastchar = lastchar_backup; // Restore lastchar
  for(newlen=x=0;x<strlen(format);x++)
@@ -2319,7 +2463,7 @@ void MDFNI_ToggleDIP(int which)
 void MDFNI_InsertCoin(void)
 {
  assert(MDFNGameInfo);
- 
+
  MDFN_QSimpleCommand(MDFN_MSC_INSERT_COIN);
 }
 
@@ -2404,7 +2548,7 @@ static bool ValidateDMS(const std::vector<DriveMediaStatus>& dms)
 
 /* Normal chain:
 
-   MDFNI_SetMedia() 
+   MDFNI_SetMedia()
       NetplaySendCommand()
       MDFNMOVAddCommand()
       MDFN_UntrustedSetMedia()

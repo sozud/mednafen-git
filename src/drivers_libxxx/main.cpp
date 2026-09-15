@@ -55,6 +55,12 @@
 #define MMX4_QUAD_OBJECTS 0x801435B0U
 #define MMX4_EFFECT_OBJECTS 0x80142F98U
 #define MMX4_BACKGROUND_OBJECTS 0x801419B0U
+#define MMX4_LAYER_OBJECTS 0x80169CB8U
+#define MMX4_PAD_BUFFER 0x80166D68U
+#define MMX4_FUNC_READ_PAD 0x80012328U
+#define MMX4_CUR_RANDOM 0x8013E2E8U
+#define MMX4_CONTROLLER_CURRENT 0x80166C08U
+#define MMX4_CONTROLLER_PREVIOUS 0x80166C0AU
 #define MMX4_CURRENT_DRAW_INFO 0x80142F80U
 #define MMX4_LOADING_FRAME_COUNTER 0x80141BD8U
 #define MMX4_FADE_AMOUNT 0x8016DEA4U
@@ -236,7 +242,10 @@ static void write_ppm(const char* path, const MDFN_Surface& surface,
 {
  FILE* fp = std::fopen(path, "wb");
  if(!fp) return;
- const unsigned w = 320;
+ const int32 native_w = line_widths && line_widths[0] != ~0
+     ? line_widths[rect.y] : (rect.w ? rect.w : surface.w);
+ const unsigned w = std::getenv("MMX4_ORACLE_FRAME_NATIVE_WIDTH")
+     ? (unsigned)native_w : 320u;
  const unsigned h = rect.h ? rect.h : surface.h;
  std::fprintf(fp, "P6\n%u %u\n255\n", w, h);
  for(unsigned y = 0; y < h; y++)
@@ -512,6 +521,13 @@ static void poke32(uint32 address, uint32 value)
 static void poke8(uint32 address, uint8 value)
 {
  poke_bytes(address, &value, 1);
+}
+
+static uint32 env_u32(const char* name, uint32 fallback)
+{
+ const char* text = std::getenv(name);
+ if(!text || !*text) return fallback;
+ return uint32(std::strtoul(text, nullptr, 0));
 }
 
 static unsigned env_u8(const char* name, unsigned fallback)
@@ -793,6 +809,248 @@ static void open_oracle_dumps()
   throw std::runtime_error("unable to open oracle dump files");
 }
 
+static bool replay_active;
+static FILE* replay_input_file;
+static uint8 replay_scene[4];
+static uint64 replay_length;
+static uint64 replay_consumed;
+static bool replay_started;
+static FILE* replay_object_log;
+static FILE* replay_frame_log;
+static long replay_logged_frame = -1;
+static unsigned long replay_duplicate_boundaries;
+static unsigned long replay_skipped_boundaries;
+static bool replay_log_complete;
+
+#define REPLAY_FIELD_NONE 0xFFFFFFFFU
+
+struct ReplayTable {
+ const char* name;
+ uint32 address;
+ uint32 count;
+ uint32 stride;
+ uint32 bg_offset;
+ uint32 x_vel;
+ uint32 y_vel;
+ uint32 texture;
+ uint32 clut;
+ uint32 animation_step;
+ uint32 animation_index;
+};
+
+/* Offsets are the canonical PSX layouts: the object header occupies 0x00..0x13,
+   BaseObj adds bg_offset at 0x14, and every velocity/animation-carrying table
+   shares 0x20/0x24 for velocity and 0x40/0x42/0x44/0x48 for texture, CLUT,
+   animation step and animation index. */
+#define REPLAY_ANIMATED 0x14U, 0x20U, 0x24U, 0x40U, 0x42U, 0x44U, 0x48U
+#define REPLAY_BASE 0x14U, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, \
+    REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE
+#define REPLAY_HEADER REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, \
+    REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE
+
+static const ReplayTable replay_tables[] = {
+ { "player", MMX4_PLAYER, 1, 0xE4, REPLAY_ANIMATED },
+ { "entity", MMX4_ENTITY, 1, 0xE4, REPLAY_ANIMATED },
+ { "main", MMX4_MAIN_OBJECTS, 0x30, 0x9C, REPLAY_ANIMATED },
+ { "visual", MMX4_VISUAL_OBJECTS, 0x20, 0x70, REPLAY_ANIMATED },
+ { "shot", MMX4_SHOT_OBJECTS, 0x20, 0x9C, REPLAY_ANIMATED },
+ { "weapon", MMX4_WEAPON_OBJECTS, 0x10, 0x9C, REPLAY_ANIMATED },
+ { "unk", MMX4_UNK_OBJECTS, 0x14, 0x60, REPLAY_ANIMATED },
+ { "item", MMX4_ITEM_OBJECTS, 0x20, 0x8C, REPLAY_ANIMATED },
+ { "misc", MMX4_MISC_OBJECTS, 0x40, 0x60, REPLAY_ANIMATED },
+ { "quad", MMX4_QUAD_OBJECTS, 0x20, 0x60, 0x37U, REPLAY_FIELD_NONE,
+   REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE,
+   REPLAY_FIELD_NONE },
+ { "layer", MMX4_LAYER_OBJECTS, 4, 0x30, REPLAY_BASE },
+ { "effect", MMX4_EFFECT_OBJECTS, 0x20, 0x30, REPLAY_HEADER },
+};
+
+static const char* replay_field_s8(char* buffer, size_t size, uint32 base,
+                                   uint32 offset)
+{
+ if(offset == REPLAY_FIELD_NONE) return "-";
+ std::snprintf(buffer, size, "%d", int(int8(peek8(base + offset))));
+ return buffer;
+}
+
+static const char* replay_field_u16(char* buffer, size_t size, uint32 base,
+                                    uint32 offset)
+{
+ if(offset == REPLAY_FIELD_NONE) return "-";
+ std::snprintf(buffer, size, "%u", unsigned(peek16(base + offset)));
+ return buffer;
+}
+
+static const char* replay_field_s32(char* buffer, size_t size, uint32 base,
+                                    uint32 offset)
+{
+ if(offset == REPLAY_FIELD_NONE) return "-";
+ std::snprintf(buffer, size, "%d", int(int32(peek32(base + offset))));
+ return buffer;
+}
+
+static void load_replay(const char* path)
+{
+ FILE* file = std::fopen(path, "rb");
+ if(!file) throw std::runtime_error(std::string("unable to open replay ") + path);
+ if(std::fseek(file, 0, SEEK_END))
+  throw std::runtime_error("replay is not seekable");
+ const long size = std::ftell(file);
+ if(size < 18 || ((size - 16) % 2))
+  throw std::runtime_error("empty, odd-length, or truncated replay");
+ std::rewind(file);
+ uint8 header[16];
+ if(std::fread(header, sizeof(header), 1, file) != 1)
+  throw std::runtime_error("unable to read replay header");
+ if(std::memcmp(header, "MMX4RPL1", 8))
+  throw std::runtime_error("invalid replay magic");
+ if(header[12] || header[13] || header[14] || header[15])
+  throw std::runtime_error("nonzero reserved replay header bytes");
+ std::memcpy(replay_scene, header + 8, sizeof(replay_scene));
+ replay_length = uint64(size - 16) / 2;
+ replay_input_file = file;
+ replay_active = true;
+ std::printf("oracle: replay %s: %llu frames, stage %u-%u, checkpoint %u, character %u\n",
+             path, (unsigned long long)replay_length, replay_scene[0],
+             replay_scene[1], replay_scene[2], replay_scene[3]);
+}
+
+/* Supply one recorded input per game loop at the engine's pad read, matching
+   how the PC port consumes the recording.  Driving playback from the emulated
+   video clock instead would consume extra inputs whenever a game loop spans
+   more than one frame. */
+static void replay_supply_input()
+{
+ if(!replay_input_file) return;
+ if(!replay_started)
+ {
+  if(peek8(MMX4_ENGINE_OBJ) != 6 || peek8(MMX4_ENGINE_STAGE) != replay_scene[0] ||
+     peek8(MMX4_ENGINE_SUBSTAGE) != replay_scene[1])
+   return;
+  replay_started = true;
+  std::printf("frame %u: replay started at stage %u-%u (engine state 6)\n",
+              frame_number, replay_scene[0], replay_scene[1]);
+ }
+ uint16 buttons = 0;
+ if(replay_consumed < replay_length)
+ {
+  uint8 raw[2];
+  if(std::fread(raw, sizeof(raw), 1, replay_input_file) != 1)
+   throw std::runtime_error("replay input stream ended unexpectedly");
+  buttons = uint16(raw[0] | (raw[1] << 8));
+  replay_consumed++;
+  if(replay_consumed == replay_length)
+   std::printf("frame %u: replay finished after %llu inputs\n", frame_number,
+               (unsigned long long)replay_consumed);
+ }
+ poke8(MMX4_PAD_BUFFER + 0, 0);
+ poke8(MMX4_PAD_BUFFER + 1, 0x41);
+ poke8(MMX4_PAD_BUFFER + 2, uint8(~buttons >> 8));
+ poke8(MMX4_PAD_BUFFER + 3, uint8(~buttons));
+}
+
+static void open_replay_logs()
+{
+ const char* directory = std::getenv("MMX4_OBJECT_LOG_DIR");
+ if(replay_object_log || !directory || !*directory) return;
+ mkdir(directory, 0755);
+ char path[4096];
+ std::snprintf(path, sizeof(path), "%s/objects.tsv", directory);
+ replay_object_log = std::fopen(path, "w");
+ std::snprintf(path, sizeof(path), "%s/frames.tsv", directory);
+ replay_frame_log = std::fopen(path, "w");
+ if(!replay_object_log || !replay_frame_log)
+  throw std::runtime_error("unable to open replay object log");
+ std::fprintf(replay_object_log,
+  "frame\tgame\tengine\ttable\tslot\tactive\tid\tsubtype\ton_screen\t"
+  "state\tstep\tsubstep\tunk7\tx\ty\txvel\tyvel\tbgoff\tanim\t"
+  "animstep\ttex\tclut\tbackref\n");
+ std::fprintf(replay_frame_log,
+  "frame\tgame\tengine\tstate\tstage\tsubstage\tcheckpoint\tcharacter\t"
+  "rng\tpad\tpad_prev\thealth\tplayer_x\tplayer_y\tbg0_x\tbg0_y\n");
+}
+
+static void dump_replay_frame()
+{
+ if(!replay_active || replay_log_complete) return;
+ open_replay_logs();
+ if(!replay_object_log) return;
+ if(!replay_started || !replay_consumed) return;
+ const long frame = long(replay_consumed) - 1;
+ if(frame == replay_logged_frame)
+ {
+  replay_duplicate_boundaries++;
+  return;
+ }
+ if(frame != replay_logged_frame + 1)
+  replay_skipped_boundaries += frame - replay_logged_frame - 1;
+ replay_logged_frame = frame;
+
+ const uint32 game = peek32(MMX4_GAME_INFO);
+ const uint32 engine = peek32(MMX4_ENGINE_OBJ);
+ std::fprintf(replay_frame_log,
+  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\n",
+  frame, game, engine, int(int8(peek8(MMX4_ENGINE_OBJ))),
+  int(int8(peek8(MMX4_ENGINE_STAGE))), int(int8(peek8(MMX4_ENGINE_SUBSTAGE))),
+  int(int8(peek8(MMX4_ENGINE_CHECKPOINT))),
+  int(int8(peek8(MMX4_ENGINE_CHARACTER))),
+  unsigned(peek16(MMX4_CUR_RANDOM)), unsigned(peek16(MMX4_CONTROLLER_CURRENT)),
+  unsigned(peek16(MMX4_CONTROLLER_PREVIOUS)),
+  int(int8(peek8(MMX4_ENGINE_OBJ + 0x46))),
+  int(int32(peek32(MMX4_PLAYER + 8))), int(int32(peek32(MMX4_PLAYER + 0xC))),
+  int(int32(peek32(MMX4_BACKGROUND_OBJECTS + 8))),
+  int(int32(peek32(MMX4_BACKGROUND_OBJECTS + 0xC))));
+
+ for(const auto& table : replay_tables)
+  for(uint32 slot = 0; slot < table.count; slot++)
+  {
+   const uint32 p = table.address + slot * table.stride;
+   const int active = int8(peek8(p));
+   const int on_screen = int8(peek8(p + 3));
+   if(!active && !on_screen) continue;
+   const uint32 backref_pointer = peek32(p + 0x10);
+   const int backref = (backref_pointer >= PSX_RAM_START && backref_pointer < PSX_RAM_END)
+       ? int(peek8(backref_pointer)) : -1;
+   char bgoff[16], xvel[16], yvel[16], tex[16], clut[16], animstep[16], anim[16];
+   std::fprintf(replay_object_log,
+    "%ld\t%08x\t%08x\t%s\t%u\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t"
+    "%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+    frame, game, engine, table.name, slot, active,
+    int(int8(peek8(p + 1))), int(int8(peek8(p + 2))), on_screen,
+    int(int8(peek8(p + 4))), int(int8(peek8(p + 5))), int(int8(peek8(p + 6))),
+    int(int8(peek8(p + 7))), int(int32(peek32(p + 8))),
+    int(int32(peek32(p + 0xC))),
+    replay_field_s32(xvel, sizeof(xvel), p, table.x_vel),
+    replay_field_s32(yvel, sizeof(yvel), p, table.y_vel),
+    replay_field_s8(bgoff, sizeof(bgoff), p, table.bg_offset),
+    replay_field_s8(anim, sizeof(anim), p, table.animation_index),
+    replay_field_s32(animstep, sizeof(animstep), p, table.animation_step),
+    replay_field_u16(tex, sizeof(tex), p, table.texture),
+    replay_field_u16(clut, sizeof(clut), p, table.clut),
+    backref);
+  }
+
+ for(uint32 slot = 0; slot < 3; slot++)
+ {
+  const uint32 p = MMX4_BACKGROUND_OBJECTS + slot * 0x54;
+  const int active = int8(peek8(p));
+  const int on_screen = int8(peek8(p + 3));
+  if(!active && !on_screen) continue;
+  std::fprintf(replay_object_log,
+   "%ld\t%08x\t%08x\tbackground\t%u\t%d\t%d\t%d\t%d\t%d\t-\t-\t-\t"
+   "%d\t%d\t%d\t%d\t-\t-\t-\t-\t-\t-1\n",
+   frame, game, engine, slot, active, int(int8(peek8(p + 1))),
+   int(int8(peek8(p + 2))), on_screen, int(int8(peek8(p + 4))),
+   int(int32(peek32(p + 8))), int(int32(peek32(p + 0xC))),
+   int(int32(peek32(p + 0x14))), int(int32(peek32(p + 0x18))));
+ }
+
+ std::fflush(replay_frame_log);
+ std::fflush(replay_object_log);
+ if(uint64(frame) + 1 == replay_length)
+  replay_log_complete = true;
+}
+
 static void dump_psx_objects(uint32 game_state, uint32 engine_state)
 {
  static bool dumped_title_background_sources;
@@ -901,6 +1159,32 @@ static void dump_psx_render(uint32 game_state, uint32 engine_state)
 
 static void cpu_hook(uint32 pc, bool)
 {
+ if(std::getenv("MMX4_TRACE_PCS") && frame_number >= 1595 && frame_number <= 1615)
+ {
+  const char* name = nullptr;
+  switch(pc)
+  {
+   case 0x8001DCCCU: name = "func_8001DCCC enter"; break;
+   case 0x8001DD08U: name = "  jal func_80013014 (load scene archive)"; break;
+   case 0x8001DD10U: name = "  jal func_800160AC (copy stage data)"; break;
+   case 0x8001DD18U: name = "  jal reset_objects"; break;
+   case 0x8001DD20U: name = "  jal func_8002AB20 (zero backgrounds)"; break;
+   case 0x8001DD28U: name = "  jal func_80028BF0"; break;
+   case 0x8001DD30U: name = "  jal func_8002771C (ACTIVATE BACKGROUNDS)"; break;
+   case 0x8001DD38U: name = "  jal func_80023CE0"; break;
+   case 0x8001DD74U: name = "  jal func_8001DC7C (CREATE QUAD)"; break;
+   case 0x8001DD84U: name = "  jal func_800129A4"; break;
+   case 0x800127C8U: name = "func_800127C8 YIELD"; break;
+   case 0x80012600U: name = "func_80012600 scheduler"; break;
+   case 0x8001211CU: name = "MAIN LOOP back-edge (oracle sample)"; break;
+   default: break;
+  }
+  if(name)
+  {
+   std::printf("TRACE f%u pc=%08x %s\n", frame_number, pc, name);
+   std::fflush(stdout);
+  }
+ }
  static bool logged_ready_source;
  static bool logged_character_archive;
  static uint32 loading_frame_counter;
@@ -921,8 +1205,28 @@ static void cpu_hook(uint32 pc, bool)
   poke32(MMX4_LOADING_FRAME_COUNTER, loading_frame_counter);
   loading_frame_sync = false;
  }
+ if(std::getenv("MMX4_BIOS_PROBE") &&
+    pc >= env_u32("MMX4_BIOS_PROBE_LO", 0x80030000U) &&
+    pc <= env_u32("MMX4_BIOS_PROBE_HI", 0x8005FFFFU))
+ {
+  static unsigned probe_hits;
+  static uint32 probe_last_ra;
+  const uint32 probe_ra = cpu_regs->GetRegister(31, nullptr, 0);
+  if(probe_hits < 12 && probe_ra != probe_last_ra)
+  {
+   probe_last_ra = probe_ra;
+   std::printf("BIOS PROBE f%u hit%u pc=%08x ra=%08x sp=%08x\n", frame_number,
+               probe_hits, pc, cpu_regs->GetRegister(31, nullptr, 0),
+               cpu_regs->GetRegister(29, nullptr, 0));
+   std::fflush(stdout);
+  }
+  probe_hits++;
+ }
+ if(pc == MMX4_FUNC_READ_PAD && replay_active)
+  replay_supply_input();
  if(pc == MMX4_FUNC_FRAME_BOUNDARY)
  {
+  dump_replay_frame();
   const char* directory = std::getenv("MMX4_ORACLE_OBJECT_CHANGE_DIR");
   if(directory && *directory)
   {
@@ -1073,7 +1377,22 @@ int main(int argc, char** argv)
   if(!MDFNI_SetMedia(0, 2, 0, 0))
    throw std::runtime_error("unable to insert disc into virtual drive");
 
+  if(const char* replay_path = std::getenv("MMX4_INPUT_PLAY"))
+  {
+   load_replay(replay_path);
+   char replay_value[4][8];
+   for(unsigned i = 0; i < 4; i++)
+    std::snprintf(replay_value[i], sizeof(replay_value[i]), "%u", replay_scene[i]);
+   setenv("MMX4_ORACLE_SCENE", "initial-stage", 1);
+   setenv("MMX4_DIRECT_STAGE", replay_value[0], 1);
+   setenv("MMX4_DIRECT_SUBSTAGE", replay_value[1], 1);
+   setenv("MMX4_DIRECT_CHECKPOINT", replay_value[2], 1);
+   setenv("MMX4_DIRECT_CHARACTER", replay_value[3], 1);
+  }
   cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
+  if(replay_active)
+   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, MMX4_FUNC_READ_PAD,
+                                           MMX4_FUNC_READ_PAD, true);
   for(uint32 pc : { MMX4_FUNC_FRAME_BOUNDARY, MMX4_FUNC_LOADING_FRAME_BEGIN, MMX4_FUNC_LOADING_FRAME_END, MMX4_FUNC_800148EC,
                     MMX4_FUNC_80018000, MMX4_FUNC_800182E8,
                     MMX4_FUNC_8001D064, MMX4_SFX_FIXTURE_RETURN,
@@ -1081,6 +1400,15 @@ int main(int argc, char** argv)
                     MMX4_FUNC_800CB048,
                     MMX4_DIRECT_BOOT_RETURN })
   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, pc, pc, true);
+ if(std::getenv("MMX4_BIOS_PROBE"))
+  MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC,
+                                          env_u32("MMX4_BIOS_PROBE_LO", 0x80030000U),
+                                          env_u32("MMX4_BIOS_PROBE_HI", 0x8005FFFFU), true);
+ if(std::getenv("MMX4_TRACE_PCS"))
+  for(uint32 pc : { 0x8001DCCCU, 0x8001DD08U, 0x8001DD10U, 0x8001DD18U,
+                    0x8001DD20U, 0x8001DD28U, 0x8001DD30U, 0x8001DD38U,
+                    0x8001DD74U, 0x8001DD84U, 0x800127C8U, 0x80012600U })
+   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, pc, pc, true);
  if(std::getenv("MMX4_ORACLE_LOG_SFX"))
  {
   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, MMX4_FUNC_PLAY_SOUND,
@@ -1131,7 +1459,8 @@ int main(int argc, char** argv)
   unsigned oracle_input_state_frames = 0;
   unsigned transition = 0;
   const char* autoplay_text = std::getenv("MMX4_ORACLE_AUTOPLAY");
-  const bool autoplay = !autoplay_text || std::strcmp(autoplay_text, "0");
+  const bool autoplay = !replay_active &&
+      (!autoplay_text || std::strcmp(autoplay_text, "0"));
   const char* burst_engine_text = std::getenv("MMX4_ORACLE_BURST_ENGINE");
   const unsigned burst_engine = burst_engine_text
       ? std::strtoul(burst_engine_text, nullptr, 0) : ~0U;
@@ -1250,11 +1579,41 @@ int main(int argc, char** argv)
    if(sfx_fixture_enabled && audio_recording &&
       frame_number + 1 >= sfx_fixture_capture_start + sfx_fixture_capture_frames)
     break;
+   if(replay_log_complete)
+   {
+    std::printf("oracle: replay object log complete after %ld frames "
+                "(duplicate boundaries %lu, skipped boundaries %lu)\n",
+                replay_logged_frame + 1, replay_duplicate_boundaries,
+                replay_skipped_boundaries);
+    break;
+   }
+   if(replay_active && replay_consumed == replay_length &&
+      !std::getenv("MMX4_OBJECT_LOG_DIR"))
+   {
+    std::printf("oracle: replay finished at frame %u\n", frame_number);
+    break;
+   }
   }
   write_ppm("tools/oracle/mednafen-screen.ppm", surface, espec.DisplayRect,
             line_widths.data());
   unlink("tools/oracle/mednafen-screen.png");
   PNGWrite("tools/oracle/mednafen-screen.png", &surface, espec.DisplayRect, line_widths.data());
+  if(replay_object_log)
+  {
+   std::fclose(replay_object_log);
+   replay_object_log = nullptr;
+  }
+  if(replay_frame_log)
+  {
+   std::fclose(replay_frame_log);
+   replay_frame_log = nullptr;
+  }
+  if(replay_active && !replay_log_complete && std::getenv("MMX4_OBJECT_LOG_DIR"))
+   std::printf("oracle: replay object log incomplete: logged %ld of %llu frames "
+               "(duplicate boundaries %lu, skipped boundaries %lu)\n",
+               replay_logged_frame + 1,
+               (unsigned long long)replay_length,
+               replay_duplicate_boundaries, replay_skipped_boundaries);
   if(audio_recording)
    MDFNI_StopWAVRecord();
   MDFNI_CloseGame();

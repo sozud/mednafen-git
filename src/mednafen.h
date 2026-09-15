@@ -48,6 +48,9 @@ void MDFN_Notify(MDFN_NoticeType t, const char* format, ...) noexcept MDFN_FORMA
 // Verbose status and informational messages, primarily during startup and exit.
 void MDFN_printf(const char *format, ...) noexcept MDFN_FORMATSTR(gnu_printf, 1, 2);
 
+void MDFNI_MMX4LoadReplay(const char* path, uint8* scene);
+bool MDFNI_MMX4ReplayFinished(void);
+
 void MDFN_DebugPrintReal(const char *file, const int line, const char *format, ...) MDFN_FORMATSTR(gnu_printf, 3, 4);
 
 #define MDFN_DebugPrint(...) MDFN_DebugPrintReal(__FILE__, __LINE__, __VA_ARGS__)
