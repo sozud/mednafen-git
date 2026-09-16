@@ -156,6 +156,7 @@ static unsigned sfx_fixture_capture_start;
 
 static void write_ppm(const char* path, const MDFN_Surface& surface,
                       const MDFN_Rect& rect, const int32* line_widths);
+static std::vector<uint8> capture_completed_vram_rgb();
 static uint32 peek32(uint32 address);
 static uint8 peek8(uint32 address);
 static uint16 peek16(uint32 address);
@@ -215,7 +216,8 @@ static void write_transition(const MDFN_Surface& surface, const MDFN_Rect& rect,
 
 static void write_frame_capture(const MDFN_Surface& surface,
                                 const MDFN_Rect& rect,
-                                const int32* line_widths)
+                                const int32* line_widths,
+                                unsigned capture_frame)
 {
  const char* directory = std::getenv("MMX4_ORACLE_FRAME_DIR");
  if(!directory || !*directory) return;
@@ -226,15 +228,22 @@ static void write_frame_capture(const MDFN_Surface& surface,
  const unsigned last = last_text ? std::strtoul(last_text, nullptr, 0) : ~0U;
  const char* interval_text = std::getenv("MMX4_ORACLE_FRAME_INTERVAL");
  const unsigned interval = interval_text ? std::strtoul(interval_text, nullptr, 0) : 1;
- if(frame_number < first || frame_number > last || !interval ||
-    ((frame_number - first) % interval))
+ if(capture_frame < first || capture_frame > last || !interval ||
+    ((capture_frame - first) % interval))
   return;
 
  mkdir(directory, 0755);
  char path[4096];
  std::snprintf(path, sizeof(path), "%s/frame_%06u.ppm", directory,
-               frame_number);
- write_ppm(path, surface, rect, line_widths);
+               capture_frame);
+ const std::vector<uint8> pixels = capture_completed_vram_rgb();
+ FILE* image = std::fopen(path, "wb");
+ if(image)
+ {
+  std::fprintf(image, "P6\n320 240\n255\n");
+  std::fwrite(pixels.data(), 1, pixels.size(), image);
+  std::fclose(image);
+ }
 }
 
 static void write_ppm(const char* path, const MDFN_Surface& surface,
@@ -815,6 +824,10 @@ static uint8 replay_scene[4];
 static uint64 replay_length;
 static uint64 replay_consumed;
 static bool replay_started;
+static bool replay_pad_clocked;
+static uint16 replay_buttons;
+static FILE* replay_normalized_file;
+static uint64 replay_normalized_frames;
 static FILE* replay_object_log;
 static FILE* replay_frame_log;
 static long replay_logged_frame = -1;
@@ -902,51 +915,90 @@ static void load_replay(const char* path)
  uint8 header[16];
  if(std::fread(header, sizeof(header), 1, file) != 1)
   throw std::runtime_error("unable to read replay header");
- if(std::memcmp(header, "MMX4RPL1", 8))
+ if(std::memcmp(header, "MMX4RPL1", 8) &&
+    std::memcmp(header, "MMX4RPL2", 8))
   throw std::runtime_error("invalid replay magic");
  if(header[12] || header[13] || header[14] || header[15])
   throw std::runtime_error("nonzero reserved replay header bytes");
  std::memcpy(replay_scene, header + 8, sizeof(replay_scene));
+ replay_pad_clocked = !std::memcmp(header, "MMX4RPL2", 8);
  replay_length = uint64(size - 16) / 2;
  replay_input_file = file;
  replay_active = true;
- std::printf("oracle: replay %s: %llu frames, stage %u-%u, checkpoint %u, character %u\n",
-             path, (unsigned long long)replay_length, replay_scene[0],
-             replay_scene[1], replay_scene[2], replay_scene[3]);
+ std::printf("oracle: replay %s: %llu %s samples, stage %u-%u, checkpoint %u, character %u\n",
+             path, (unsigned long long)replay_length,
+             replay_pad_clocked ? "pad-read" : "video-frame", replay_scene[0], replay_scene[1],
+             replay_scene[2], replay_scene[3]);
 }
 
-/* Supply one recorded input per game loop at the engine's pad read, matching
-   how the PC port consumes the recording.  Driving playback from the emulated
-   video clock instead would consume extra inputs whenever a game loop spans
-   more than one frame. */
+static bool replay_begin()
+{
+ if(replay_started) return true;
+ if(peek8(MMX4_ENGINE_OBJ) != 6 || peek8(MMX4_ENGINE_STAGE) != replay_scene[0] ||
+    peek8(MMX4_ENGINE_SUBSTAGE) != replay_scene[1])
+  return false;
+ replay_started = true;
+ poke32(MMX4_LOADING_FRAME_COUNTER, 0);
+ std::printf("frame %u: replay started at stage %u-%u (engine state 6)\n",
+             frame_number, replay_scene[0], replay_scene[1]);
+ return true;
+}
+
+static void replay_advance_sample()
+{
+ replay_buttons = 0;
+ if(replay_consumed >= replay_length) return;
+ uint8 raw[2];
+ if(std::fread(raw, sizeof(raw), 1, replay_input_file) != 1)
+  throw std::runtime_error("replay input stream ended unexpectedly");
+ replay_buttons = uint16(raw[0] | (raw[1] << 8));
+ replay_consumed++;
+ if(replay_consumed == replay_length)
+  std::printf("frame %u: replay finished after %llu inputs\n", frame_number,
+              (unsigned long long)replay_consumed);
+}
+
+/* Recordings are sampled by the interactive Mednafen frontend once per
+   emulated video frame.  Advance at that same boundary, then hold the sample
+   through every game pad read in the frame. */
+static void replay_advance_input_frame()
+{
+ if(!replay_input_file || replay_pad_clocked || !replay_begin()) return;
+ replay_advance_sample();
+}
+
 static void replay_supply_input()
 {
- if(!replay_input_file) return;
- if(!replay_started)
+ if(!replay_input_file || !replay_begin()) return;
+ if(replay_pad_clocked)
+  replay_advance_sample();
+ if(!replay_normalized_file)
  {
-  if(peek8(MMX4_ENGINE_OBJ) != 6 || peek8(MMX4_ENGINE_STAGE) != replay_scene[0] ||
-     peek8(MMX4_ENGINE_SUBSTAGE) != replay_scene[1])
-   return;
-  replay_started = true;
-  std::printf("frame %u: replay started at stage %u-%u (engine state 6)\n",
-              frame_number, replay_scene[0], replay_scene[1]);
+  const char* path = std::getenv("MMX4_INPUT_NORMALIZE");
+  if(path && *path)
+  {
+   if(replay_pad_clocked)
+    throw std::runtime_error("MMX4_INPUT_NORMALIZE requires a legacy MMX4RPL1 replay");
+   replay_normalized_file = std::fopen(path, "wbx");
+   if(!replay_normalized_file)
+    throw std::runtime_error("unable to create normalized replay");
+   uint8 header[16] = { 'M', 'M', 'X', '4', 'R', 'P', 'L', '2' };
+   std::memcpy(header + 8, replay_scene, sizeof(replay_scene));
+   if(std::fwrite(header, sizeof(header), 1, replay_normalized_file) != 1)
+    throw std::runtime_error("unable to write normalized replay header");
+  }
  }
- uint16 buttons = 0;
- if(replay_consumed < replay_length)
+ if(replay_normalized_file)
  {
-  uint8 raw[2];
-  if(std::fread(raw, sizeof(raw), 1, replay_input_file) != 1)
-   throw std::runtime_error("replay input stream ended unexpectedly");
-  buttons = uint16(raw[0] | (raw[1] << 8));
-  replay_consumed++;
-  if(replay_consumed == replay_length)
-   std::printf("frame %u: replay finished after %llu inputs\n", frame_number,
-               (unsigned long long)replay_consumed);
+  if(std::fputc(replay_buttons & 0xFF, replay_normalized_file) == EOF ||
+     std::fputc(replay_buttons >> 8, replay_normalized_file) == EOF)
+   throw std::runtime_error("unable to write normalized replay input");
+  replay_normalized_frames++;
  }
  poke8(MMX4_PAD_BUFFER + 0, 0);
  poke8(MMX4_PAD_BUFFER + 1, 0x41);
- poke8(MMX4_PAD_BUFFER + 2, uint8(~buttons >> 8));
- poke8(MMX4_PAD_BUFFER + 3, uint8(~buttons));
+ poke8(MMX4_PAD_BUFFER + 2, uint8(~replay_buttons >> 8));
+ poke8(MMX4_PAD_BUFFER + 3, uint8(~replay_buttons));
 }
 
 static void open_replay_logs()
@@ -967,7 +1019,7 @@ static void open_replay_logs()
   "animstep\ttex\tclut\tbackref\n");
  std::fprintf(replay_frame_log,
   "frame\tgame\tengine\tstate\tstage\tsubstage\tcheckpoint\tcharacter\t"
-  "rng\tpad\tpad_prev\thealth\tplayer_x\tplayer_y\tbg0_x\tbg0_y\n");
+  "rng\tpad\tpad_prev\thealth\tplayer_x\tplayer_y\tbg0_x\tbg0_y\tphase\n");
 }
 
 static void dump_replay_frame()
@@ -989,7 +1041,7 @@ static void dump_replay_frame()
  const uint32 game = peek32(MMX4_GAME_INFO);
  const uint32 engine = peek32(MMX4_ENGINE_OBJ);
  std::fprintf(replay_frame_log,
-  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\n",
+  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\t%d\n",
   frame, game, engine, int(int8(peek8(MMX4_ENGINE_OBJ))),
   int(int8(peek8(MMX4_ENGINE_STAGE))), int(int8(peek8(MMX4_ENGINE_SUBSTAGE))),
   int(int8(peek8(MMX4_ENGINE_CHECKPOINT))),
@@ -999,7 +1051,8 @@ static void dump_replay_frame()
   int(int8(peek8(MMX4_ENGINE_OBJ + 0x46))),
   int(int32(peek32(MMX4_PLAYER + 8))), int(int32(peek32(MMX4_PLAYER + 0xC))),
   int(int32(peek32(MMX4_BACKGROUND_OBJECTS + 8))),
-  int(int32(peek32(MMX4_BACKGROUND_OBJECTS + 0xC))));
+  int(int32(peek32(MMX4_BACKGROUND_OBJECTS + 0xC))),
+  int(int32(peek32(MMX4_LOADING_FRAME_COUNTER))));
 
  for(const auto& table : replay_tables)
   for(uint32 slot = 0; slot < table.count; slot++)
@@ -1473,6 +1526,7 @@ int main(int argc, char** argv)
   for(frame_number = 0; frame_number < max_frames; frame_number++)
   {
    std::memset(pad, 0, 2);
+   replay_advance_input_frame();
    const uint32 engine = peek32(MMX4_ENGINE_OBJ);
    const uint32 game_state = peek32(MMX4_GAME_INFO);
    const uint64 packed_input_state = (uint64(game_state) << 32) | engine;
@@ -1542,7 +1596,15 @@ int main(int argc, char** argv)
     logged_background_sources = true;
    }
    dump_psx_render(captured_state, captured_engine);
-   write_frame_capture(surface, espec.DisplayRect, line_widths.data());
+   write_frame_capture(surface, espec.DisplayRect, line_widths.data(),
+                       replay_started && replay_consumed
+                           ? unsigned(replay_consumed - 1) : frame_number);
+   if(replay_started && replay_consumed)
+   {
+    const char* stop_text = std::getenv("MMX4_ORACLE_FRAME_STOP_AFTER");
+    if(stop_text && replay_consumed - 1 >= std::strtoul(stop_text, nullptr, 0))
+     break;
+   }
    if(captured_state != previous_state || captured_engine != previous_engine)
    {
     pending.clear();
@@ -1616,6 +1678,14 @@ int main(int argc, char** argv)
                replay_duplicate_boundaries, replay_skipped_boundaries);
   if(audio_recording)
    MDFNI_StopWAVRecord();
+  if(replay_normalized_file)
+  {
+   if(std::fclose(replay_normalized_file))
+    throw std::runtime_error("unable to close normalized replay");
+   replay_normalized_file = nullptr;
+   std::printf("oracle: normalized replay contains %llu game-loop inputs\n",
+               (unsigned long long)replay_normalized_frames);
+  }
   MDFNI_CloseGame();
   MDFNI_Kill();
  }

@@ -65,9 +65,14 @@ void DBG_Break(void)
  FoundBPoint = true;
 }
 
+void (*MMX4_BranchHook)(uint32 from, uint32 to, bool exception) = NULL;
+
 static void AddBranchTrace(uint32 from, uint32 to, bool exception)
 {
  BTEntry *prevbt = &BTEntries[(BTIndex + NUMBT - 1) % NUMBT];
+
+ if(MMX4_BranchHook)
+  MMX4_BranchHook(from, to, exception);
 
  //if(BTEntries[(BTIndex - 1) & 0xF] == PC) return;
 
@@ -727,4 +732,3 @@ bool DBG_Init(void)
 
 
 }
-
