@@ -24,6 +24,7 @@
 #include <mednafen/string/escape.h>
 
 #include <mednafen/hash/md5.h>
+#include <mednafen/hash/sha256.h>
 #include <mednafen/MemoryStream.h>
 #include <mednafen/Time.h>
 
@@ -280,11 +281,23 @@ static uint32 PortDataLen[16];
 static FILE* mmx4_replay_file;
 static bool mmx4_replay_open_attempted;
 static uint64 mmx4_replay_frames;
+static uint8 mmx4_replay_scene[4];
+static uint8 mmx4_replay_previous_state;
+static bool mmx4_replay_previous_load_busy;
+struct MMX4ReplaySyncPoint
+{
+ uint64 sample;
+ const char* kind;
+ bool has_mode;
+};
+static std::vector<MMX4ReplaySyncPoint> mmx4_replay_sync_points;
+static sha256_hasher mmx4_replay_hasher;
 static FILE* mmx4_play_file;
 static uint8 mmx4_play_scene[4];
 static uint64 mmx4_play_frames;
 static uint64 mmx4_play_length;
 static bool mmx4_play_started;
+static bool mmx4_play_pad_clocked;
 
 void MDFNI_MMX4LoadReplay(const char* path, uint8* scene)
 {
@@ -296,7 +309,8 @@ void MDFNI_MMX4LoadReplay(const char* path, uint8* scene)
  if(size < 18 || (size - 16) % 2)
   throw MDFN_Error(0, "MMX4 replay: empty or truncated input stream");
  file.read(header, sizeof(header));
- if(memcmp(header, "MMX4RPL1", 8) || header[12] || header[13] || header[14] || header[15])
+ if((memcmp(header, "MMX4RPL1", 8) && memcmp(header, "MMX4RPL2", 8)) ||
+    header[12] || header[13] || header[14] || header[15])
   throw MDFN_Error(0, "MMX4 replay: invalid or unsupported header");
  mmx4_play_file = fopen(path, "rb");
  if(!mmx4_play_file || fseek(mmx4_play_file, 16, SEEK_SET))
@@ -306,8 +320,10 @@ void MDFNI_MMX4LoadReplay(const char* path, uint8* scene)
  mmx4_play_frames = 0;
  mmx4_play_length = (size - 16) / 2;
  mmx4_play_started = false;
- MDFN_printf("MMX4 replay: loaded %llu frames from %s\n",
-             (unsigned long long)mmx4_play_length, path);
+ mmx4_play_pad_clocked = !memcmp(header, "MMX4RPL2", 8);
+ MDFN_printf("MMX4 replay: loaded %llu %s samples from %s\n",
+             (unsigned long long)mmx4_play_length,
+             mmx4_play_pad_clocked ? "pad-read" : "video-frame", path);
 }
 
 bool MDFNI_MMX4ReplayFinished(void)
@@ -373,26 +389,91 @@ static void MMX4RecordInput(void)
    MDFN_Notify(MDFN_NOTICE_ERROR, "MMX4 replay: unable to create %s", path);
    return;
   }
-  uint8 header[16] = { 'M', 'M', 'X', '4', 'R', 'P', 'L', '1' };
+  uint8 header[16] = { 'M', 'M', 'X', '4', 'R', 'P', 'L', '2' };
   header[8] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721CCU);
   header[9] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721CDU);
   header[10] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721DDU);
   header[11] = MDFN_IEN_PSX::PSX_MemPeek8(0x00172203U);
   if(fwrite(header, sizeof(header), 1, mmx4_replay_file) != 1)
    throw MDFN_Error(errno, "MMX4 replay: unable to write header");
+  memcpy(mmx4_replay_scene, header + 8, sizeof(mmx4_replay_scene));
+  mmx4_replay_hasher.reset();
+  mmx4_replay_hasher.process(header, sizeof(header));
+  mmx4_replay_previous_state = state;
+  mmx4_replay_previous_load_busy =
+   MDFN_IEN_PSX::PSX_MemPeek8(0x001406ACU) == 1 ||
+   MDFN_IEN_PSX::PSX_MemPeek8(0x0013BD40U) != 0;
+  mmx4_replay_sync_points.clear();
+  mmx4_replay_sync_points.push_back({ 0, "start", true });
   MDFN_printf("MMX4 replay: recording started at stage %u-%u (engine state 6)\n",
               header[8], header[9]);
   MDFN_Notify(MDFN_NOTICE_STATUS, "MMX4 replay recording started: %s", path);
  }
+
+ if(state == 6 && mmx4_replay_previous_state != 6)
+  mmx4_replay_sync_points.push_back({ mmx4_replay_frames, "mode-return", true });
+ mmx4_replay_previous_state = state;
+ const bool load_busy = MDFN_IEN_PSX::PSX_MemPeek8(0x001406ACU) == 1 ||
+                        MDFN_IEN_PSX::PSX_MemPeek8(0x0013BD40U) != 0;
+ if(mmx4_replay_previous_load_busy && !load_busy)
+  mmx4_replay_sync_points.push_back({ mmx4_replay_frames, "load-complete", false });
+ mmx4_replay_previous_load_busy = load_busy;
 
  const uint16 raw = uint16(PortData[0][0]) | (uint16(PortData[0][1]) << 8);
  const uint16 input = MMX4ConvertGamepad(raw);
  if(fputc(input & 0xFF, mmx4_replay_file) == EOF ||
     fputc(input >> 8, mmx4_replay_file) == EOF)
   throw MDFN_Error(errno, "MMX4 replay: unable to write input");
+ const uint8 encoded[2] = { uint8(input), uint8(input >> 8) };
+ mmx4_replay_hasher.process(encoded, sizeof(encoded));
  mmx4_replay_frames++;
  if(!(mmx4_replay_frames % 60) && fflush(mmx4_replay_file))
   throw MDFN_Error(errno, "MMX4 replay: unable to flush input");
+}
+
+void MDFNI_MMX4PadRead(void)
+{
+ if(mmx4_play_pad_clocked)
+  MMX4PlaybackInput();
+ MMX4RecordInput();
+}
+
+static void MMX4WriteReplaySync(void)
+{
+ const char* replay_path = getenv("MMX4_INPUT_RECORD");
+ if(!replay_path || !*replay_path || !mmx4_replay_frames)
+  return;
+ const std::string path = std::string(replay_path) + ".sync.json";
+ FILE* file = fopen(path.c_str(), "w");
+ if(!file)
+ {
+  MDFN_Notify(MDFN_NOTICE_ERROR, "MMX4 replay: unable to create %s", path.c_str());
+  return;
+ }
+ const sha256_digest digest = mmx4_replay_hasher.digest();
+ fprintf(file, "{\n  \"format\": \"MMX4SYNC1\",\n  \"replay_sha256\": \"");
+ for(uint8 byte : digest)
+  fprintf(file, "%02x", byte);
+ fprintf(file, "\",\n  \"clock\": \"pad-read\",\n  \"samples\": %llu,\n"
+               "  \"scene\": {\"stage\": %u, \"substage\": %u, "
+               "\"checkpoint\": %u, \"character\": %u},\n"
+               "  \"sync_points\": [\n",
+         (unsigned long long)mmx4_replay_frames,
+         mmx4_replay_scene[0], mmx4_replay_scene[1],
+         mmx4_replay_scene[2], mmx4_replay_scene[3]);
+ for(size_t i = 0; i < mmx4_replay_sync_points.size(); i++)
+ {
+  const MMX4ReplaySyncPoint& point = mmx4_replay_sync_points[i];
+  fprintf(file, "    {\"sample\": %llu, %s\"kind\": \"%s\"}%s\n",
+          (unsigned long long)point.sample, point.has_mode ? "\"mode\": 6, " : "",
+          point.kind, i + 1 == mmx4_replay_sync_points.size() ? "" : ",");
+ }
+ fprintf(file, "  ]\n}\n");
+ if(fclose(file))
+  MDFN_Notify(MDFN_NOTICE_ERROR, "MMX4 replay: error closing %s", path.c_str());
+ else
+  MDFN_printf("MMX4 replay: wrote %zu sync points to %s\n",
+              mmx4_replay_sync_points.size(), path.c_str());
 }
 
 static void MMX4CloseReplay(void)
@@ -409,11 +490,14 @@ static void MMX4CloseReplay(void)
   if(fclose(mmx4_replay_file))
    MDFN_Notify(MDFN_NOTICE_ERROR, "MMX4 replay: error closing recording");
   mmx4_replay_file = nullptr;
-  MDFN_printf("MMX4 replay: recorded %llu frames\n",
+  MMX4WriteReplaySync();
+  MDFN_printf("MMX4 replay: recorded %llu pad-read samples\n",
               (unsigned long long)mmx4_replay_frames);
  }
  mmx4_replay_open_attempted = false;
  mmx4_replay_frames = 0;
+ mmx4_replay_sync_points.clear();
+ mmx4_play_pad_clocked = false;
 }
 
 MDFNGI* MDFNGameInfo = NULL;
@@ -2077,8 +2161,8 @@ void MDFNI_Emulate(EmulateSpecStruct *espec)
 
  MDFNMOV_ProcessInput(PortData, PortDataLen, MDFNGameInfo->PortInfo.size());
 
- MMX4PlaybackInput();
- MMX4RecordInput();
+ if(!mmx4_play_pad_clocked)
+  MMX4PlaybackInput();
 
  if(qtrecorder)
   espec->skip = 0;

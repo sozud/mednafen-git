@@ -85,6 +85,7 @@ static const uint32 MMX4_FUNC_ENGINE_STATE_0 = 0x8001FBB8U;
 static const uint32 MMX4_FUNC_RESET_GAME_ENGINE = 0x8002A6FCU;
 static const uint32 MMX4_DIRECT_BOOT_RETURN = 0x801FFF00U;
 static const uint32 MMX4_FUNC_FRAME_BOUNDARY = 0x8001211CU;
+static const uint32 MMX4_FUNC_READ_PAD = 0x80012328U;
 
 static const RegGroupType* mmx4_cpu_regs;
 static unsigned mmx4_boot_frames;
@@ -239,6 +240,8 @@ static void MMX4AdvanceDirectBoot(void)
 
 static void MMX4DirectBootCPUHook(uint32 pc, bool)
 {
+ if(pc == MMX4_FUNC_READ_PAD)
+  MDFNI_MMX4PadRead();
  if(mmx4_trace_enabled && !mmx4_trace_started &&
     MDFN_IEN_PSX::PSX_MemPeek8(MMX4_ENGINE_OBJ & 0x1FFFFFFF) == 6)
  {
@@ -302,7 +305,8 @@ static void MMX4InstallDirectBoot(void)
  mmx4_direct_phase = 0;
  mmx4_cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
  for(uint32 pc : { MMX4_FUNC_MOVIE_0, MMX4_FUNC_MOVIE_1,
-                   MMX4_FUNC_MAIN, MMX4_DIRECT_BOOT_RETURN })
+                   MMX4_FUNC_MAIN, MMX4_DIRECT_BOOT_RETURN,
+                   MMX4_FUNC_READ_PAD })
   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, pc, pc, true);
  mmx4_fast_boot = getenv("MMX4_FAST_BOOT") && strtoul(getenv("MMX4_FAST_BOOT"), nullptr, 0);
  if(mmx4_fast_boot)

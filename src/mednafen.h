@@ -50,6 +50,7 @@ void MDFN_printf(const char *format, ...) noexcept MDFN_FORMATSTR(gnu_printf, 1,
 
 void MDFNI_MMX4LoadReplay(const char* path, uint8* scene);
 bool MDFNI_MMX4ReplayFinished(void);
+void MDFNI_MMX4PadRead(void);
 
 void MDFN_DebugPrintReal(const char *file, const int line, const char *format, ...) MDFN_FORMATSTR(gnu_printf, 3, 4);
 
