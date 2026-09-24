@@ -51,6 +51,7 @@
 #define MMX4_WEAPON_OBJECTS 0x801406F8U
 #define MMX4_UNK_OBJECTS 0x801410C0U
 #define MMX4_ITEM_OBJECTS 0x80165A30U
+#define MMX4_QUX_OBJECT 0x80173A30U
 #define MMX4_MISC_OBJECTS 0x80173CA0U
 #define MMX4_QUAD_OBJECTS 0x801435B0U
 #define MMX4_EFFECT_OBJECTS 0x80142F98U
@@ -93,6 +94,10 @@
 #define PSX_SPU_REG_1DAB 0x1F801DABU
 #define MMX4_FUNC_FRAME_BOUNDARY 0x8001211CU
 #define MMX4_FUNC_CD_READ_COMPLETE 0x800137F0U
+#define MMX4_FUNC_XA_STOP 0x80016F0CU
+#define MMX4_FUNC_XA_POLL 0x800168D8U
+#define MMX4_FUNC_XA_POLL_END 0x800169D8U
+#define MMX4_XA_STREAM_STATE 0x80141BD4U
 #define MMX4_FUNC_LOAD_COMMON_ARCHIVES 0x80012E38U
 #define MMX4_FUNC_LOAD_PLAYER_ARCHIVES 0x80012EB8U
 #define MMX4_FUNC_LOAD_SCENE_ARCHIVE 0x80013014U
@@ -828,6 +833,9 @@ static uint64 replay_length;
 static uint64 replay_consumed;
 static uint32 replay_cd_reads;
 static uint32 replay_cd_read_sample;
+static uint32 replay_cd_read_pending;
+static uint32 replay_xa_stops;
+static uint32 replay_xa_stop_sample;
 static bool replay_started;
 static bool replay_pad_clocked;
 static uint16 replay_buttons;
@@ -878,6 +886,7 @@ static const ReplayTable replay_tables[] = {
  { "unk", MMX4_UNK_OBJECTS, 0x14, 0x60, REPLAY_ANIMATED },
  { "item", MMX4_ITEM_OBJECTS, 0x20, 0x8C, REPLAY_ANIMATED },
  { "misc", MMX4_MISC_OBJECTS, 0x40, 0x60, REPLAY_ANIMATED },
+ { "qux", MMX4_QUX_OBJECT, 1, 0xB0, REPLAY_ANIMATED },
  { "quad", MMX4_QUAD_OBJECTS, 0x20, 0x60, 0x37U, REPLAY_FIELD_NONE,
    REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE, REPLAY_FIELD_NONE,
    REPLAY_FIELD_NONE },
@@ -1032,7 +1041,7 @@ static void open_replay_logs()
   "frame\tgame\tengine\tstate\tstage\tsubstage\tcheckpoint\tcharacter\t"
   "rng\tpad\tpad_prev\thealth\tplayer_x\tplayer_y\tbg0_x\tbg0_y\tphase\t"
   "cd_state\tcd_pending\thud\tboss\ttransition\tentity_intro\t"
-  "player_health\tcd_reads\tcd_read_sample\n");
+  "player_health\tcd_reads\tcd_read_sample\tcd_read_pending\txa_stops\txa_stop_sample\n");
  std::fprintf(replay_extension_log,
   "frame\tgame\tengine\ttable\tslot\tid\text80_value\text84_value\t"
   "ext88\text89\text8a\text8b\text8c\n");
@@ -1078,7 +1087,7 @@ static void dump_replay_frame()
  const uint32 game = peek32(MMX4_GAME_INFO);
  const uint32 engine = peek32(MMX4_ENGINE_OBJ);
  std::fprintf(replay_frame_log,
-  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%d\t%d\t%d\t%d\t%u\t%u\t%u\n",
+  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%u\t%u\t%u\n",
   frame, game, engine, int(int8(peek8(MMX4_ENGINE_OBJ))),
   int(int8(peek8(MMX4_ENGINE_STAGE))), int(int8(peek8(MMX4_ENGINE_SUBSTAGE))),
   int(int8(peek8(MMX4_ENGINE_CHECKPOINT))),
@@ -1096,7 +1105,9 @@ static void dump_replay_frame()
   int(int8(peek8(MMX4_ENGINE_OBJ + 0x1E))),
   int(int8(peek8(MMX4_ENTITY + 0xD9))),
   unsigned(peek8(MMX4_PLAYER + 0x5C)), unsigned(replay_cd_reads),
-  unsigned(replay_cd_read_sample));
+  unsigned(replay_cd_read_sample), unsigned(replay_cd_read_pending),
+  unsigned(replay_xa_stops),
+  unsigned(replay_xa_stop_sample));
 
  for(const auto& table : replay_tables)
   for(uint32 slot = 0; slot < table.count; slot++)
@@ -1386,6 +1397,16 @@ static void cpu_hook(uint32 pc, bool)
  {
   replay_cd_reads++;
   replay_cd_read_sample = uint32(replay_consumed);
+  replay_cd_read_pending = peek8(MMX4_CD_PENDING);
+ }
+ if(pc == MMX4_FUNC_XA_STOP && replay_consumed && peek32(MMX4_XA_STREAM_STATE) == 2)
+ {
+  const uint32 ra = cpu_regs->GetRegister(31, nullptr, 0);
+  if(ra >= MMX4_FUNC_XA_POLL && ra < MMX4_FUNC_XA_POLL_END)
+  {
+   replay_xa_stops++;
+   replay_xa_stop_sample = uint32(replay_consumed);
+  }
  }
  if(pc == MMX4_FUNC_FRAME_BOUNDARY)
  {
@@ -1559,6 +1580,8 @@ int main(int argc, char** argv)
                                            MMX4_FUNC_READ_PAD, true);
    MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, MMX4_FUNC_CD_READ_COMPLETE,
                                            MMX4_FUNC_CD_READ_COMPLETE, true);
+   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, MMX4_FUNC_XA_STOP,
+                                           MMX4_FUNC_XA_STOP, true);
   }
   for(uint32 pc : { MMX4_FUNC_FRAME_BOUNDARY, MMX4_FUNC_LOADING_FRAME_BEGIN, MMX4_FUNC_LOADING_FRAME_END, MMX4_FUNC_800148EC,
                     MMX4_FUNC_80018000, MMX4_FUNC_800182E8,
