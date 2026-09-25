@@ -310,12 +310,12 @@ void MDFNI_MMX4LoadReplay(const char* path, uint8* scene)
   throw MDFN_Error(0, "MMX4 replay: empty or truncated input stream");
  file.read(header, sizeof(header));
  if((memcmp(header, "MMX4RPL1", 8) && memcmp(header, "MMX4RPL2", 8)) ||
-    header[12] || header[13] || header[14] || header[15])
+    header[12] > 1 || header[13] || header[14] || header[15])
   throw MDFN_Error(0, "MMX4 replay: invalid or unsupported header");
  mmx4_play_file = fopen(path, "rb");
  if(!mmx4_play_file || fseek(mmx4_play_file, 16, SEEK_SET))
   throw MDFN_Error(errno, "MMX4 replay: unable to open input stream");
- memcpy(scene, header + 8, 4);
+ memcpy(scene, header + 8, 5);
  memcpy(mmx4_play_scene, scene, 4);
  mmx4_play_frames = 0;
  mmx4_play_length = (size - 16) / 2;
@@ -394,6 +394,8 @@ static void MMX4RecordInput(void)
   header[9] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721CDU);
   header[10] = MDFN_IEN_PSX::PSX_MemPeek8(0x001721DDU);
   header[11] = MDFN_IEN_PSX::PSX_MemPeek8(0x00172203U);
+  if(const char* loadout = getenv("MMX4_DIRECT_LOADOUT"))
+   header[12] = strtoul(loadout, nullptr, 0) == 1;
   if(fwrite(header, sizeof(header), 1, mmx4_replay_file) != 1)
    throw MDFN_Error(errno, "MMX4 replay: unable to write header");
   memcpy(mmx4_replay_scene, header + 8, sizeof(mmx4_replay_scene));

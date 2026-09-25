@@ -97,6 +97,7 @@ static uint8 mmx4_direct_stage;
 static uint8 mmx4_direct_substage;
 static uint8 mmx4_direct_checkpoint;
 static uint8 mmx4_direct_character;
+static uint8 mmx4_direct_loadout;
 
 struct MMX4TraceFunction
 {
@@ -172,6 +173,25 @@ static uint8 MMX4EnvU8(const char* name, uint8 fallback)
  return parsed <= 0xFF ? uint8(parsed) : fallback;
 }
 
+static void MMX4ApplyLoadout(void)
+{
+ static const uint8 max_gear[][2] =
+ {
+  { 0x44, 4 }, { 0x45, 0x30 }, { 0x46, 0x30 }, { 0x59, 0xFF },
+  { 0x5A, 0xFF }, { 0x5B, 0xF0 }, { 0x5C, 0xA0 }, { 0x5D, 0xA0 }, { 0x5E, 0x20 },
+ };
+ if(mmx4_direct_loadout != 1)
+  return;
+ for(const auto& field : max_gear)
+  MMX4Poke8(MMX4_ENGINE_OBJ + field[0], field[1]);
+ if(mmx4_direct_character == 0)
+ {
+  MMX4Poke8(MMX4_ENGINE_OBJ + 0x47, 0x0F);
+  MMX4Poke8(MMX4_ENGINE_OBJ + 0x48, 2);
+ }
+ MDFN_printf("MMX4 replay: max gear loadout applied\n");
+}
+
 static uint8 MMX4Peek8(uint32 address)
 {
  return uint8(MDFN_IEN_PSX::PSX_DBGInfo.MemPeek(address, 1, true, true));
@@ -193,6 +213,7 @@ static void MMX4ApplyDirectBoot(void)
   mmx4_direct_substage = MMX4EnvU8("MMX4_DIRECT_SUBSTAGE", 0);
   mmx4_direct_checkpoint = MMX4EnvU8("MMX4_DIRECT_CHECKPOINT", 0);
   mmx4_direct_character = MMX4EnvU8("MMX4_DIRECT_CHARACTER", 0);
+  mmx4_direct_loadout = MMX4EnvU8("MMX4_DIRECT_LOADOUT", 0);
  }
  engine[0x0C] = 0xE;
  engine[0x0D] = 0;
@@ -204,9 +225,9 @@ static void MMX4ApplyDirectBoot(void)
  mmx4_direct_phase = 1;
  MMX4DirectCall(MMX4_FUNC_LOAD_SCENE_ARCHIVE);
  mmx4_direct_applied = true;
- MDFN_printf("MMX4 replay: direct booting stage %u-%u, checkpoint %u, character %u\n",
+ MDFN_printf("MMX4 replay: direct booting stage %u-%u, checkpoint %u, character %u, loadout %u\n",
              mmx4_direct_stage, mmx4_direct_substage,
-             mmx4_direct_checkpoint, mmx4_direct_character);
+             mmx4_direct_checkpoint, mmx4_direct_character, mmx4_direct_loadout);
 }
 
 static void MMX4AdvanceDirectBoot(void)
@@ -231,6 +252,7 @@ static void MMX4AdvanceDirectBoot(void)
    MMX4Poke8(MMX4_ENGINE_SUBSTAGE, mmx4_direct_substage);
    MMX4Poke8(MMX4_ENGINE_CHECKPOINT, mmx4_direct_checkpoint);
    MMX4Poke8(MMX4_ENGINE_CHARACTER, mmx4_direct_character);
+   MMX4ApplyLoadout();
    mmx4_cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
    mmx4_cpu_regs->SetRegister(33, MMX4_FUNC_ENGINE_DISPATCH + 4);
    MDFN_printf("MMX4 replay: direct boot archives ready\n");
@@ -294,12 +316,13 @@ static void MMX4InstallDirectBoot(void)
  MMX4LoadFunctionTrace();
  if(const char* path = getenv("MMX4_INPUT_PLAY"))
  {
-  uint8 scene[4];
+  uint8 scene[5];
   MDFNI_MMX4LoadReplay(path, scene);
   mmx4_direct_stage = scene[0];
   mmx4_direct_substage = scene[1];
   mmx4_direct_checkpoint = scene[2];
   mmx4_direct_character = scene[3];
+  mmx4_direct_loadout = scene[4];
  }
  mmx4_direct_applied = false;
  mmx4_direct_phase = 0;

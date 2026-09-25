@@ -677,6 +677,7 @@ static uint8 direct_boot_stage;
 static uint8 direct_boot_substage;
 static uint8 direct_boot_checkpoint;
 static uint8 direct_boot_character;
+static uint8 direct_boot_loadout;
 static bool direct_boot_mission_briefing;
 static void direct_boot_call(uint32 function)
 {
@@ -707,6 +708,7 @@ static void apply_direct_boot()
  direct_boot_substage = env_u8("MMX4_DIRECT_SUBSTAGE", 0);
  direct_boot_checkpoint = env_u8("MMX4_DIRECT_CHECKPOINT", 0);
  direct_boot_character = env_u8("MMX4_DIRECT_CHARACTER", 0);
+ direct_boot_loadout = env_u8("MMX4_DIRECT_LOADOUT", 0);
  engine[0x0C] = 0xE;
  engine[0x0D] = 0;
  engine[0x43] = direct_boot_character;
@@ -721,6 +723,25 @@ static void apply_direct_boot()
              direct_boot_checkpoint, direct_boot_character,
              peek32(MMX4_SP_TILES), peek32(MMX4_SP_DESCRIPTORS),
              peek32(MMX4_SP_PALETTE_SLOT), peek32(MMX4_SP_GRAPHICS_SLOT));
+}
+
+static void apply_direct_boot_loadout()
+{
+ static const uint8 max_gear[][2] =
+ {
+  { 0x44, 4 }, { 0x45, 0x30 }, { 0x46, 0x30 }, { 0x59, 0xFF },
+  { 0x5A, 0xFF }, { 0x5B, 0xF0 }, { 0x5C, 0xA0 }, { 0x5D, 0xA0 }, { 0x5E, 0x20 },
+ };
+ if(direct_boot_loadout != 1)
+  return;
+ for(const auto& field : max_gear)
+  poke8(MMX4_ENGINE_OBJ + field[0], field[1]);
+ if(direct_boot_character == 0)
+ {
+  poke8(MMX4_ENGINE_OBJ + 0x47, 0x0F);
+  poke8(MMX4_ENGINE_OBJ + 0x48, 2);
+ }
+ std::printf("frame %u: direct boot max gear loadout applied\n", frame_number);
 }
 
 static void advance_direct_boot()
@@ -769,6 +790,7 @@ static void advance_direct_boot()
     poke8(MMX4_ENGINE_SUBSTAGE, direct_boot_substage);
     poke8(MMX4_ENGINE_CHECKPOINT, direct_boot_checkpoint);
     poke8(MMX4_ENGINE_CHARACTER, direct_boot_character);
+    apply_direct_boot_loadout();
    }
    cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
    cpu_regs->SetRegister(33, (MMX4_FUNC_ENGINE_DISPATCH + 4));
@@ -829,6 +851,7 @@ static void open_oracle_dumps()
 static bool replay_active;
 static FILE* replay_input_file;
 static uint8 replay_scene[4];
+static uint8 replay_loadout;
 static uint64 replay_length;
 static uint64 replay_consumed;
 static uint32 replay_cd_reads;
@@ -934,8 +957,9 @@ static void load_replay(const char* path)
  if(std::memcmp(header, "MMX4RPL1", 8) &&
     std::memcmp(header, "MMX4RPL2", 8))
   throw std::runtime_error("invalid replay magic");
- if(header[12] || header[13] || header[14] || header[15])
+ if(header[12] > 1 || header[13] || header[14] || header[15])
   throw std::runtime_error("nonzero reserved replay header bytes");
+ replay_loadout = header[12];
  std::memcpy(replay_scene, header + 8, sizeof(replay_scene));
  replay_pad_clocked = !std::memcmp(header, "MMX4RPL2", 8);
  replay_length = uint64(size - 16) / 2;
@@ -1564,14 +1588,16 @@ int main(int argc, char** argv)
   if(const char* replay_path = std::getenv("MMX4_INPUT_PLAY"))
   {
    load_replay(replay_path);
-   char replay_value[4][8];
+   char replay_value[5][8];
    for(unsigned i = 0; i < 4; i++)
     std::snprintf(replay_value[i], sizeof(replay_value[i]), "%u", replay_scene[i]);
+   std::snprintf(replay_value[4], sizeof(replay_value[4]), "%u", replay_loadout);
    setenv("MMX4_ORACLE_SCENE", "initial-stage", 1);
    setenv("MMX4_DIRECT_STAGE", replay_value[0], 1);
    setenv("MMX4_DIRECT_SUBSTAGE", replay_value[1], 1);
    setenv("MMX4_DIRECT_CHECKPOINT", replay_value[2], 1);
    setenv("MMX4_DIRECT_CHARACTER", replay_value[3], 1);
+   setenv("MMX4_DIRECT_LOADOUT", replay_value[4], 1);
   }
   cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
   if(replay_active)
