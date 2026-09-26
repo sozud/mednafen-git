@@ -113,6 +113,8 @@
 #define MMX4_FUNC_8001DAF8 0x8001DAF8U
 #define MMX4_FUNC_ENGINE_DISPATCH 0x8001FB50U
 #define MMX4_FUNC_ENGINE_STATE_0 0x8001FBB8U
+#define MMX4_FUNC_ENGINE_STATE_4 0x8001FBE0U
+#define MMX4_FUNC_STAGE_SELECT_EXIT 0x8002EDD4U
 #define MMX4_FUNC_8001FC20 0x8001FC20U
 #define MMX4_FUNC_RESET_GAME_ENGINE 0x8002A6FCU
 #define MMX4_FUNC_800B2C8C 0x800B2C8CU
@@ -678,6 +680,7 @@ static uint8 direct_boot_substage;
 static uint8 direct_boot_checkpoint;
 static uint8 direct_boot_character;
 static uint8 direct_boot_loadout;
+static uint8 direct_boot_story;
 static bool direct_boot_mission_briefing;
 static void direct_boot_call(uint32 function)
 {
@@ -709,6 +712,7 @@ static void apply_direct_boot()
  direct_boot_checkpoint = env_u8("MMX4_DIRECT_CHECKPOINT", 0);
  direct_boot_character = env_u8("MMX4_DIRECT_CHARACTER", 0);
  direct_boot_loadout = env_u8("MMX4_DIRECT_LOADOUT", 0);
+ direct_boot_story = env_u8("MMX4_DIRECT_STORY", 0);
  engine[0x0C] = 0xE;
  engine[0x0D] = 0;
  engine[0x43] = direct_boot_character;
@@ -732,16 +736,24 @@ static void apply_direct_boot_loadout()
   { 0x44, 4 }, { 0x45, 0x30 }, { 0x46, 0x30 }, { 0x59, 0xFF },
   { 0x5A, 0xFF }, { 0x5B, 0xF0 }, { 0x5C, 0xA0 }, { 0x5D, 0xA0 }, { 0x5E, 0x20 },
  };
- if(direct_boot_loadout != 1)
+ if(direct_boot_loadout != 1 && direct_boot_loadout != 2)
   return;
  for(const auto& field : max_gear)
   poke8(MMX4_ENGINE_OBJ + field[0], field[1]);
+ if(direct_boot_loadout == 2)
+ {
+  const uint8 flags = direct_boot_mission_briefing ? 0 :
+      (direct_boot_stage >= 1 && direct_boot_stage <= 8 ?
+       uint8(0xFFU & ~(1U << (direct_boot_stage - 1))) : 0xFF);
+  poke8(MMX4_ENGINE_OBJ + 0x59, flags);
+ }
  if(direct_boot_character == 0)
  {
   poke8(MMX4_ENGINE_OBJ + 0x47, 0x0F);
   poke8(MMX4_ENGINE_OBJ + 0x48, 2);
  }
- std::printf("frame %u: direct boot max gear loadout applied\n", frame_number);
+ std::printf("frame %u: direct boot %s loadout applied\n", frame_number,
+             direct_boot_loadout == 2 ? "boss gear" : "max gear");
 }
 
 static void advance_direct_boot()
@@ -767,9 +779,12 @@ static void advance_direct_boot()
  case 6:
    if(direct_boot_mission_briefing)
    {
-    poke8(MMX4_ENGINE_OBJ, 3);
-    poke8(MMX4_ENGINE_STAGE, 0);
-    poke8(MMX4_ENGINE_SUBSTAGE, 0);
+   poke8(MMX4_ENGINE_OBJ, 3);
+   poke8(MMX4_ENGINE_STAGE, 0);
+   poke8(MMX4_ENGINE_SUBSTAGE, 0);
+   poke8(MMX4_ENGINE_CHARACTER, direct_boot_character);
+   apply_direct_boot_loadout();
+   poke8(MMX4_ENGINE_OBJ + 0x5F, direct_boot_story);
     cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
     cpu_regs->SetRegister(33, (MMX4_FUNC_ENGINE_DISPATCH + 4));
     std::printf("frame %u: direct boot entering mission briefing\n",
@@ -781,17 +796,21 @@ static void advance_direct_boot()
     direct_boot_call(MMX4_FUNC_ENGINE_STATE_0);
    }
    break;
+  case 7:
+  {
+   poke8(MMX4_ENGINE_OBJ, 4);
+   poke8(MMX4_ENGINE_STAGE, direct_boot_stage);
+   poke8(MMX4_ENGINE_SUBSTAGE, direct_boot_substage);
+   poke8(MMX4_ENGINE_CHARACTER, direct_boot_character);
+   apply_direct_boot_loadout();
+   poke8(MMX4_ENGINE_OBJ + 0x5F, direct_boot_story);
+   cpu_regs->SetRegister(4, MMX4_ENGINE_OBJ);
+   direct_boot_call(MMX4_FUNC_ENGINE_STATE_4);
+   break;
+  }
   default:
   {
-   poke8(MMX4_ENGINE_OBJ, direct_boot_mission_briefing ? 3 : 4);
-   if(!direct_boot_mission_briefing)
-   {
-    poke8(MMX4_ENGINE_STAGE, direct_boot_stage);
-    poke8(MMX4_ENGINE_SUBSTAGE, direct_boot_substage);
-    poke8(MMX4_ENGINE_CHECKPOINT, direct_boot_checkpoint);
-    poke8(MMX4_ENGINE_CHARACTER, direct_boot_character);
-    apply_direct_boot_loadout();
-   }
+   poke8(MMX4_ENGINE_CHECKPOINT, direct_boot_checkpoint);
    cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
    cpu_regs->SetRegister(33, (MMX4_FUNC_ENGINE_DISPATCH + 4));
    std::printf("frame %u: direct boot archives ready slots=%08x,%08x,%08x,%08x\n",
@@ -852,6 +871,7 @@ static bool replay_active;
 static FILE* replay_input_file;
 static uint8 replay_scene[4];
 static uint8 replay_loadout;
+static uint8 replay_story;
 static uint64 replay_length;
 static uint64 replay_consumed;
 static uint32 replay_cd_reads;
@@ -957,9 +977,10 @@ static void load_replay(const char* path)
  if(std::memcmp(header, "MMX4RPL1", 8) &&
     std::memcmp(header, "MMX4RPL2", 8))
   throw std::runtime_error("invalid replay magic");
- if(header[12] > 1 || header[13] || header[14] || header[15])
-  throw std::runtime_error("nonzero reserved replay header bytes");
+ if(header[12] > 2 || header[13] > 10 || header[14] || header[15])
+  throw std::runtime_error("invalid replay header values");
  replay_loadout = header[12];
+ replay_story = header[13];
  std::memcpy(replay_scene, header + 8, sizeof(replay_scene));
  replay_pad_clocked = !std::memcmp(header, "MMX4RPL2", 8);
  replay_length = uint64(size - 16) / 2;
@@ -1024,6 +1045,8 @@ static void replay_supply_input()
     throw std::runtime_error("unable to create normalized replay");
    uint8 header[16] = { 'M', 'M', 'X', '4', 'R', 'P', 'L', '2' };
    std::memcpy(header + 8, replay_scene, sizeof(replay_scene));
+   header[12] = replay_loadout;
+   header[13] = replay_story;
    if(std::fwrite(header, sizeof(header), 1, replay_normalized_file) != 1)
     throw std::runtime_error("unable to write normalized replay header");
   }
@@ -1504,6 +1527,14 @@ static void cpu_hook(uint32 pc, bool)
   apply_direct_boot();
  else if(pc == MMX4_DIRECT_BOOT_RETURN && direct_boot_applied)
   advance_direct_boot();
+ else if(pc == MMX4_FUNC_STAGE_SELECT_EXIT && direct_boot_mission_briefing &&
+         direct_boot_loadout == 2)
+ {
+  const uint8 stage = peek8(MMX4_ENGINE_STAGE);
+  if(stage >= 1 && stage <= 8)
+   poke8(MMX4_ENGINE_OBJ + 0x59,
+         uint8(0xFFU & ~(1U << (stage - 1))));
+ }
  else if(pc == MMX4_FUNC_800B2C8C)
  {
   const uint32 slot3 = peek32(MMX4_SP_GRAPHICS_SLOT);
@@ -1588,16 +1619,18 @@ int main(int argc, char** argv)
   if(const char* replay_path = std::getenv("MMX4_INPUT_PLAY"))
   {
    load_replay(replay_path);
-   char replay_value[5][8];
+   char replay_value[6][8];
    for(unsigned i = 0; i < 4; i++)
     std::snprintf(replay_value[i], sizeof(replay_value[i]), "%u", replay_scene[i]);
    std::snprintf(replay_value[4], sizeof(replay_value[4]), "%u", replay_loadout);
+   std::snprintf(replay_value[5], sizeof(replay_value[5]), "%u", replay_story);
    setenv("MMX4_ORACLE_SCENE", "initial-stage", 1);
    setenv("MMX4_DIRECT_STAGE", replay_value[0], 1);
    setenv("MMX4_DIRECT_SUBSTAGE", replay_value[1], 1);
    setenv("MMX4_DIRECT_CHECKPOINT", replay_value[2], 1);
    setenv("MMX4_DIRECT_CHARACTER", replay_value[3], 1);
    setenv("MMX4_DIRECT_LOADOUT", replay_value[4], 1);
+   setenv("MMX4_DIRECT_STORY", replay_value[5], 1);
   }
   cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
   if(replay_active)
@@ -1614,7 +1647,7 @@ int main(int argc, char** argv)
                     MMX4_FUNC_8001D064, MMX4_SFX_FIXTURE_RETURN,
                     MMX4_FUNC_8001DAF8, MMX4_FUNC_8001FC20, MMX4_FUNC_800B2C8C,
                     MMX4_FUNC_800CB048,
-                    MMX4_DIRECT_BOOT_RETURN })
+                    MMX4_DIRECT_BOOT_RETURN, MMX4_FUNC_STAGE_SELECT_EXIT })
   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, pc, pc, true);
  if(std::getenv("MMX4_BIOS_PROBE"))
   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC,
@@ -1689,7 +1722,7 @@ int main(int argc, char** argv)
       : 0;
   struct PendingCapture { unsigned index; uint32 game; uint32 engine; };
   std::vector<PendingCapture> pending;
-  for(frame_number = 0; frame_number < max_frames; frame_number++)
+  for(frame_number = 0; !max_frames || frame_number < max_frames; frame_number++)
   {
    std::memset(pad, 0, 2);
    replay_advance_input_frame();

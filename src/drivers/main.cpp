@@ -82,6 +82,8 @@ static const uint32 MMX4_FUNC_MOVIE_1 = 0x800182E8U;
 static const uint32 MMX4_FUNC_MAIN = 0x8001DAF8U;
 static const uint32 MMX4_FUNC_ENGINE_DISPATCH = 0x8001FB50U;
 static const uint32 MMX4_FUNC_ENGINE_STATE_0 = 0x8001FBB8U;
+static const uint32 MMX4_FUNC_ENGINE_STATE_4 = 0x8001FBE0U;
+static const uint32 MMX4_FUNC_STAGE_SELECT_EXIT = 0x8002EDD4U;
 static const uint32 MMX4_FUNC_RESET_GAME_ENGINE = 0x8002A6FCU;
 static const uint32 MMX4_DIRECT_BOOT_RETURN = 0x801FFF00U;
 static const uint32 MMX4_FUNC_FRAME_BOUNDARY = 0x8001211CU;
@@ -98,6 +100,8 @@ static uint8 mmx4_direct_substage;
 static uint8 mmx4_direct_checkpoint;
 static uint8 mmx4_direct_character;
 static uint8 mmx4_direct_loadout;
+static uint8 mmx4_direct_story;
+static bool mmx4_direct_stage_select;
 
 struct MMX4TraceFunction
 {
@@ -180,16 +184,24 @@ static void MMX4ApplyLoadout(void)
   { 0x44, 4 }, { 0x45, 0x30 }, { 0x46, 0x30 }, { 0x59, 0xFF },
   { 0x5A, 0xFF }, { 0x5B, 0xF0 }, { 0x5C, 0xA0 }, { 0x5D, 0xA0 }, { 0x5E, 0x20 },
  };
- if(mmx4_direct_loadout != 1)
+ if(mmx4_direct_loadout != 1 && mmx4_direct_loadout != 2)
   return;
  for(const auto& field : max_gear)
   MMX4Poke8(MMX4_ENGINE_OBJ + field[0], field[1]);
+ if(mmx4_direct_loadout == 2)
+ {
+  const uint8 flags = mmx4_direct_stage_select ? 0 :
+      (mmx4_direct_stage >= 1 && mmx4_direct_stage <= 8 ?
+       uint8(0xFFU & ~(1U << (mmx4_direct_stage - 1))) : 0xFF);
+  MMX4Poke8(MMX4_ENGINE_OBJ + 0x59, flags);
+ }
  if(mmx4_direct_character == 0)
  {
   MMX4Poke8(MMX4_ENGINE_OBJ + 0x47, 0x0F);
   MMX4Poke8(MMX4_ENGINE_OBJ + 0x48, 2);
  }
- MDFN_printf("MMX4 replay: max gear loadout applied\n");
+ MDFN_printf("MMX4 replay: %s loadout applied\n",
+             mmx4_direct_loadout == 2 ? "boss gear" : "max gear");
 }
 
 static uint8 MMX4Peek8(uint32 address)
@@ -214,6 +226,9 @@ static void MMX4ApplyDirectBoot(void)
   mmx4_direct_checkpoint = MMX4EnvU8("MMX4_DIRECT_CHECKPOINT", 0);
   mmx4_direct_character = MMX4EnvU8("MMX4_DIRECT_CHARACTER", 0);
   mmx4_direct_loadout = MMX4EnvU8("MMX4_DIRECT_LOADOUT", 0);
+  mmx4_direct_story = MMX4EnvU8("MMX4_DIRECT_STORY", 0);
+  const char* scene = getenv("MMX4_ORACLE_SCENE");
+  mmx4_direct_stage_select = scene && !strcmp(scene, "mission-briefing");
  }
  engine[0x0C] = 0xE;
  engine[0x0D] = 0;
@@ -225,9 +240,10 @@ static void MMX4ApplyDirectBoot(void)
  mmx4_direct_phase = 1;
  MMX4DirectCall(MMX4_FUNC_LOAD_SCENE_ARCHIVE);
  mmx4_direct_applied = true;
- MDFN_printf("MMX4 replay: direct booting stage %u-%u, checkpoint %u, character %u, loadout %u\n",
+ MDFN_printf("MMX4 replay: direct booting stage %u-%u, checkpoint %u, character %u, loadout %u, story %u\n",
              mmx4_direct_stage, mmx4_direct_substage,
-             mmx4_direct_checkpoint, mmx4_direct_character, mmx4_direct_loadout);
+             mmx4_direct_checkpoint, mmx4_direct_character, mmx4_direct_loadout,
+             mmx4_direct_story);
 }
 
 static void MMX4AdvanceDirectBoot(void)
@@ -243,16 +259,34 @@ static void MMX4AdvanceDirectBoot(void)
   case 4: MMX4DirectCall(MMX4_FUNC_LOAD_PLAYER_ARCHIVES); break;
   case 5: MMX4DirectCall(MMX4_FUNC_RESET_GAME_ENGINE); break;
   case 6:
+   if(mmx4_direct_stage_select)
+   {
+    MMX4Poke8(MMX4_ENGINE_OBJ, 3);
+    MMX4Poke8(MMX4_ENGINE_STAGE, 0);
+    MMX4Poke8(MMX4_ENGINE_SUBSTAGE, 0);
+    MMX4Poke8(MMX4_ENGINE_CHARACTER, mmx4_direct_character);
+    MMX4ApplyLoadout();
+    MMX4Poke8(MMX4_ENGINE_OBJ + 0x5F, mmx4_direct_story);
+    mmx4_cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
+    mmx4_cpu_regs->SetRegister(33, MMX4_FUNC_ENGINE_DISPATCH + 4);
+    MDFN_printf("MMX4 replay: direct boot entered stage select\n");
+    break;
+   }
    mmx4_cpu_regs->SetRegister(4, MMX4_ENGINE_OBJ);
    MMX4DirectCall(MMX4_FUNC_ENGINE_STATE_0);
    break;
-  default:
+  case 7:
    MMX4Poke8(MMX4_ENGINE_OBJ, 4);
    MMX4Poke8(MMX4_ENGINE_STAGE, mmx4_direct_stage);
    MMX4Poke8(MMX4_ENGINE_SUBSTAGE, mmx4_direct_substage);
-   MMX4Poke8(MMX4_ENGINE_CHECKPOINT, mmx4_direct_checkpoint);
    MMX4Poke8(MMX4_ENGINE_CHARACTER, mmx4_direct_character);
    MMX4ApplyLoadout();
+   MMX4Poke8(MMX4_ENGINE_OBJ + 0x5F, mmx4_direct_story);
+   mmx4_cpu_regs->SetRegister(4, MMX4_ENGINE_OBJ);
+   MMX4DirectCall(MMX4_FUNC_ENGINE_STATE_4);
+   break;
+  default:
+   MMX4Poke8(MMX4_ENGINE_CHECKPOINT, mmx4_direct_checkpoint);
    mmx4_cpu_regs->SetRegister(32, MMX4_FUNC_ENGINE_DISPATCH);
    mmx4_cpu_regs->SetRegister(33, MMX4_FUNC_ENGINE_DISPATCH + 4);
    MDFN_printf("MMX4 replay: direct boot archives ready\n");
@@ -292,10 +326,20 @@ static void MMX4DirectBootCPUHook(uint32 pc, bool)
   MMX4ApplyDirectBoot();
  else if(pc == MMX4_DIRECT_BOOT_RETURN && mmx4_direct_applied)
   MMX4AdvanceDirectBoot();
+ else if(pc == MMX4_FUNC_STAGE_SELECT_EXIT && mmx4_direct_stage_select &&
+         mmx4_direct_loadout == 2)
+ {
+  const uint8 stage = MMX4Peek8(MMX4_ENGINE_STAGE);
+  if(stage >= 1 && stage <= 8)
+   MMX4Poke8(MMX4_ENGINE_OBJ + 0x59,
+             uint8(0xFFU & ~(1U << (stage - 1))));
+ }
  else if(pc == MMX4_FUNC_FRAME_BOUNDARY)
  {
   if(mmx4_fast_boot && !mmx4_fast_boot_ending &&
-     (MMX4Peek8(MMX4_ENGINE_OBJ) == 6 || mmx4_boot_frames > 6000))
+     (MMX4Peek8(MMX4_ENGINE_OBJ) == 6 ||
+      (mmx4_direct_stage_select && MMX4Peek8(MMX4_ENGINE_OBJ) == 3) ||
+      mmx4_boot_frames > 6000))
   {
    mmx4_fast_boot_ending = true;
    MDFN_printf("MMX4 fast boot: normal speed restored after %u frames\n",
@@ -316,20 +360,21 @@ static void MMX4InstallDirectBoot(void)
  MMX4LoadFunctionTrace();
  if(const char* path = getenv("MMX4_INPUT_PLAY"))
  {
-  uint8 scene[5];
+  uint8 scene[6];
   MDFNI_MMX4LoadReplay(path, scene);
   mmx4_direct_stage = scene[0];
   mmx4_direct_substage = scene[1];
   mmx4_direct_checkpoint = scene[2];
   mmx4_direct_character = scene[3];
   mmx4_direct_loadout = scene[4];
+  mmx4_direct_story = scene[5];
  }
  mmx4_direct_applied = false;
  mmx4_direct_phase = 0;
  mmx4_cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
  for(uint32 pc : { MMX4_FUNC_MOVIE_0, MMX4_FUNC_MOVIE_1,
                    MMX4_FUNC_MAIN, MMX4_DIRECT_BOOT_RETURN,
-                   MMX4_FUNC_READ_PAD })
+                   MMX4_FUNC_READ_PAD, MMX4_FUNC_STAGE_SELECT_EXIT })
   MDFN_IEN_PSX::PSX_DBGInfo.AddBreakPoint(BPOINT_PC, pc, pc, true);
  mmx4_fast_boot = getenv("MMX4_FAST_BOOT") && strtoul(getenv("MMX4_FAST_BOOT"), nullptr, 0);
  if(mmx4_fast_boot)
