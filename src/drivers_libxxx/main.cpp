@@ -6,6 +6,7 @@
 #include <mednafen/psx/gpu.h>
 #include <mednafen/psx/spu.h>
 #include <mednafen/video/png.h>
+#include <mednafen/MemoryStream.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -1093,7 +1094,7 @@ static void open_replay_logs()
   "frame\tgame\tengine\ttable\tslot\tid\text80_value\text84_value\t"
   "ext88\text89\text8a\text8b\text8c\n");
  std::fprintf(replay_state_log,
-  "frame\tgame\tengine\ttable\tslot\tregion_a\tregion_b\tregion_c\n");
+  "frame\tgame\tengine\ttable\tslot\tregion_a\tregion_b\tregion_c\tbounds\n");
 }
 
 static void write_replay_state_bytes(uint32 address, uint32 offset, uint32 end)
@@ -1106,13 +1107,16 @@ static void write_replay_state_bytes(uint32 address, uint32 offset, uint32 end)
 static void write_replay_state(long frame, uint32 game, uint32 engine,
                                const char* table, uint32 slot, uint32 address,
                                uint32 a, uint32 a_end, uint32 b, uint32 b_end,
-                               uint32 c, uint32 c_end)
+                               uint32 c, uint32 c_end, int bounds = -1)
 {
  std::fprintf(replay_state_log, "%ld\t%08x\t%08x\t%s\t%u", frame, game, engine, table, slot);
  write_replay_state_bytes(address, a, a_end);
  write_replay_state_bytes(address, b, b_end);
  write_replay_state_bytes(address, c, c_end);
- std::fputc('\n', replay_state_log);
+ if(bounds < 0)
+  std::fputs("\t-\n", replay_state_log);
+ else
+  std::fprintf(replay_state_log, "\t%d\n", bounds);
 }
 
 static void dump_replay_frame()
@@ -1219,9 +1223,11 @@ static void dump_replay_frame()
  write_replay_state(frame, game, engine, "engine", 0, MMX4_ENGINE_OBJ,
                     0x00, 0x20, 0x24, 0x38, 0x40, 0x61);
  write_replay_state(frame, game, engine, "player", 0, MMX4_PLAYER,
-                    0x5C, 0x68, 0x6C, 0xC8, 0xD4, 0xE4);
+                    0x5C, 0x68, 0x6C, 0xC8, 0xD4, 0xE4,
+                    peek32(MMX4_PLAYER + 0x68) != 0);
  write_replay_state(frame, game, engine, "entity", 0, MMX4_ENTITY,
-                    0x5C, 0x68, 0x6C, 0xC8, 0xD4, 0xE4);
+                    0x5C, 0x68, 0x6C, 0xC8, 0xD4, 0xE4,
+                    peek32(MMX4_ENTITY + 0x68) != 0);
  for(uint32 slot = 0; slot < 3; slot++)
   write_replay_state(frame, game, engine, "background", slot,
                      MMX4_BACKGROUND_OBJECTS + slot * 0x54,
@@ -1584,6 +1590,80 @@ static void cpu_hook(uint32 pc, bool)
  MDFN_IEN_PSX::PSX_DBGInfo.SetCPUCallback(cpu_hook, false);
 }
 
+struct Shot
+{
+ unsigned stage, substage, checkpoint, character, loadout;
+};
+
+static std::vector<Shot> shots;
+static size_t shot_index;
+static std::string shot_directory;
+
+static void load_shot_list(const char* path)
+{
+ FILE* list = std::fopen(path, "r");
+ if(!list) throw std::runtime_error(std::string("unable to open shot list ") + path);
+ char line[256];
+ while(std::fgets(line, sizeof(line), list))
+ {
+  Shot shot = {};
+  const int fields = std::sscanf(line, "%u %u %u %u %u", &shot.stage,
+                                 &shot.substage, &shot.checkpoint,
+                                 &shot.character, &shot.loadout);
+  if(fields >= 3)
+   shots.push_back(shot);
+ }
+ std::fclose(list);
+ if(shots.empty()) throw std::runtime_error("shot list is empty");
+}
+
+static void select_shot(const Shot& shot)
+{
+ char value[5][8];
+ const unsigned fields[5] = { shot.stage, shot.substage, shot.checkpoint,
+                              shot.character, shot.loadout };
+ static const char* const names[5] =
+ {
+  "MMX4_DIRECT_STAGE", "MMX4_DIRECT_SUBSTAGE", "MMX4_DIRECT_CHECKPOINT",
+  "MMX4_DIRECT_CHARACTER", "MMX4_DIRECT_LOADOUT",
+ };
+ for(unsigned i = 0; i < 5; i++)
+ {
+  std::snprintf(value[i], sizeof(value[i]), "%u", fields[i]);
+  setenv(names[i], value[i], 1);
+ }
+}
+
+static void write_shot(const Shot& shot, const MDFN_Surface& surface,
+                       const MDFN_Rect& rect, const int32* line_widths,
+                       const char* status, unsigned frames)
+{
+ char filename[128], path[4096], manifest_path[4096];
+ std::snprintf(filename, sizeof(filename), "s%02u_%u_c%02u_ch%u.png",
+               shot.stage, shot.substage, shot.checkpoint, shot.character);
+ std::snprintf(path, sizeof(path), "%s/%s", shot_directory.c_str(), filename);
+ unlink(path);
+ PNGWrite(path, &surface, rect, line_widths);
+ std::snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.tsv",
+               shot_directory.c_str());
+ FILE* manifest = std::fopen(manifest_path, shot_index ? "a" : "w");
+ if(manifest)
+ {
+  if(!shot_index)
+   std::fprintf(manifest, "stage\tsubstage\tcheckpoint\tcharacter\tloadout\t"
+                "status\tframes\tengine\tplayer_x\tplayer_y\tfilename\n");
+  std::fprintf(manifest, "%u\t%u\t%u\t%u\t%u\t%s\t%u\t%08x\t%d\t%d\t%s\n",
+               shot.stage, shot.substage, shot.checkpoint, shot.character,
+               shot.loadout, status, frames, peek32(MMX4_ENGINE_OBJ),
+               int16(peek16(MMX4_PLAYER + 0x0a)),
+               int16(peek16(MMX4_PLAYER + 0x0e)), filename);
+  std::fclose(manifest);
+ }
+ std::fprintf(stderr, "shot %zu/%zu: %u-%u checkpoint %u %s after %u frames\n",
+              shot_index + 1, shots.size(), shot.stage, shot.substage,
+              shot.checkpoint, status, frames);
+}
+
 int main(int argc, char** argv)
 {
  if(argc < 3)
@@ -1631,6 +1711,17 @@ int main(int argc, char** argv)
    setenv("MMX4_DIRECT_CHARACTER", replay_value[3], 1);
    setenv("MMX4_DIRECT_LOADOUT", replay_value[4], 1);
    setenv("MMX4_DIRECT_STORY", replay_value[5], 1);
+  }
+  if(const char* shot_list = std::getenv("MMX4_SHOT_LIST"))
+  {
+   const char* directory = std::getenv("MMX4_SHOT_DIR");
+   if(!directory || !*directory)
+    throw std::runtime_error("MMX4_SHOT_LIST requires MMX4_SHOT_DIR");
+   shot_directory = directory;
+   mkdir(directory, 0755);
+   load_shot_list(shot_list);
+   setenv("MMX4_ORACLE_SCENE", "initial-stage", 1);
+   select_shot(shots[0]);
   }
   cpu_regs = MDFN_IEN_PSX::PSX_DBGInfo.RegGroups->at(0);
   if(replay_active)
@@ -1722,8 +1813,22 @@ int main(int argc, char** argv)
       : 0;
   struct PendingCapture { unsigned index; uint32 game; uint32 engine; };
   std::vector<PendingCapture> pending;
-  for(frame_number = 0; !max_frames || frame_number < max_frames; frame_number++)
+  const bool shot_mode = !shots.empty();
+  const unsigned shot_settle = env_u32("MMX4_SHOT_SETTLE", 30);
+  const unsigned shot_timeout = env_u32("MMX4_SHOT_TIMEOUT", 1500);
+  std::unique_ptr<MemoryStream> snapshot;
+  unsigned snapshot_frame = 0;
+  bool snapshot_locked = false;
+  unsigned shot_frames = 0;
+  unsigned shot_ready_frames = 0;
+  for(frame_number = 0; shot_mode || !max_frames || frame_number < max_frames; frame_number++)
   {
+   if(shot_mode && !snapshot_locked && !direct_boot_applied)
+   {
+    snapshot.reset(new MemoryStream(8 << 20));
+    MDFNSS_SaveSM(snapshot.get(), true);
+    snapshot_frame = frame_number;
+   }
    std::memset(pad, 0, 2);
    replay_advance_input_frame();
    const uint32 engine = peek32(MMX4_ENGINE_OBJ);
@@ -1836,6 +1941,41 @@ int main(int argc, char** argv)
     write_transition(surface, espec.DisplayRect, line_widths.data(),
                      transition++, captured_state, captured_engine);
     burst_remaining--;
+   }
+   if(shot_mode && direct_boot_applied)
+   {
+    if(!snapshot_locked)
+    {
+     snapshot_locked = true;
+     std::fprintf(stderr, "shot snapshot taken at frame %u\n", snapshot_frame);
+    }
+    shot_frames++;
+    const bool ready = (captured_engine & 0xFF) == 6 &&
+        (peek32(MMX4_FADE_AMOUNT) & 0xFFFF) == 0 &&
+        peek8(MMX4_PLAYER + 4) == 1 && peek8(MMX4_PLAYER + 5) >= 2 &&
+        has_visible_pixels(surface, espec.DisplayRect, line_widths.data());
+    shot_ready_frames = ready ? shot_ready_frames + 1 : 0;
+    if(shot_ready_frames >= shot_settle || shot_frames >= shot_timeout)
+    {
+     write_shot(shots[shot_index], surface, espec.DisplayRect,
+                line_widths.data(),
+                shot_ready_frames >= shot_settle ? "ok" : "timeout",
+                shot_frames);
+     if(++shot_index == shots.size())
+      break;
+     select_shot(shots[shot_index]);
+     snapshot->rewind();
+     MDFNSS_LoadSM(snapshot.get(), true);
+     direct_boot_applied = false;
+     shot_frames = 0;
+     shot_ready_frames = 0;
+     pending.clear();
+     previous_state = ~0U;
+     previous_engine = ~0U;
+     stable_state_frames = 0;
+     frame_number = snapshot_frame - 1;
+     continue;
+    }
    }
    if(sfx_fixture_enabled && audio_recording &&
       frame_number + 1 >= sfx_fixture_capture_start + sfx_fixture_capture_frames)
