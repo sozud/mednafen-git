@@ -107,6 +107,8 @@ namespace MDFN_IEN_PSX
  void PSX_MemPoke32(uint32 A, uint32 V);
 
  void PSX_RequestMLExit(void);
+ MDFN_HIDE extern bool PSX_PCDrvEnabled;
+ bool PSX_PCDrv(uint32 code, uint32* gpr);
  void ForceEventUpdates(const pscpu_timestamp_t timestamp);
 
  enum

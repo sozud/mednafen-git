@@ -656,6 +656,14 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
       case 0xB03F:
 	PSX_DBG_BIOS_PUTS(GPR[4]);
 	break;
+
+      case 0xB035:
+	if(GPR[4] == 1)
+	{
+	 for(uint32 i = 0; i < GPR[6]; i++)
+	  PSX_DBG_BIOS_PUTC(PSX_MemPeek8((GPR[5] + i) & 0x1FFFFFFF));
+	}
+	break;
      }
     }
    }
@@ -1036,7 +1044,8 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
     //
     BEGIN_OPF(BREAK);
 	DO_LDS();
-	new_PC = Exception(EXCEPTION_BP, PC, new_PC, instr);
+	if(!PSX_PCDrvEnabled || !PSX_PCDrv((instr >> 6) & 0xFFFFF, GPR))
+	 new_PC = Exception(EXCEPTION_BP, PC, new_PC, instr);
     END_OPF;
 
     // Cop "instructions":	CFCz(no CP0), COPz, CTCz(no CP0), LWCz(no CP0), MFCz, MTCz, SWCz(no CP0)

@@ -34,6 +34,7 @@
 #include <mednafen/cheat_formats/psx.h>
 
 #include <zlib.h>
+#include <unistd.h>
 
 namespace MDFN_IEN_PSX
 {
@@ -506,6 +507,130 @@ void PSX_RequestMLExit(void)
 // End event stuff
 //
 
+bool PSX_PCDrvEnabled = false;
+static bool TestMode = false;
+static std::string PCDrvBase;
+static FILE* PCDrvFiles[32];
+
+static void PCDrvCloseAll(void)
+{
+ for(auto& f : PCDrvFiles)
+ {
+  if(f)
+  {
+   fclose(f);
+   f = NULL;
+  }
+ }
+}
+
+static void TestExit(int16 code)
+{
+ PCDrvCloseAll();
+ fflush(stdout);
+ fflush(stderr);
+ _exit(code);
+}
+
+static std::string PCDrvPath(uint32 addr)
+{
+ std::string name;
+
+ for(uint8 c; name.size() < 1024 && (c = PSX_MemPeek8((addr + name.size()) & 0x1FFFFFFF)); )
+  name.push_back(c);
+
+ return PCDrvBase + "/" + name;
+}
+
+static int PCDrvAlloc(FILE* f)
+{
+ if(f)
+ {
+  for(unsigned fd = 1; fd < 32; fd++)
+  {
+   if(!PCDrvFiles[fd])
+   {
+    PCDrvFiles[fd] = f;
+    return fd;
+   }
+  }
+  fclose(f);
+ }
+ return -1;
+}
+
+static FILE* PCDrvFile(uint32 fd)
+{
+ return fd < 32 ? PCDrvFiles[fd] : NULL;
+}
+
+bool PSX_PCDrv(uint32 code, uint32* gpr)
+{
+ const uint32 a0 = gpr[4], a1 = gpr[5], a2 = gpr[6], a3 = gpr[7];
+ int32 v1 = -1;
+ FILE* f;
+
+ switch(code)
+ {
+  default:
+	return false;
+
+  case 0x101:
+	PCDrvCloseAll();
+	v1 = 0;
+	break;
+
+  case 0x102:
+	v1 = PCDrvAlloc(fopen(PCDrvPath(a0).c_str(), "w+b"));
+	break;
+
+  case 0x103:
+	v1 = PCDrvAlloc(fopen(PCDrvPath(a0).c_str(), a2 ? "r+b" : "rb"));
+	break;
+
+  case 0x104:
+	if((f = PCDrvFile(a0)))
+	{
+	 fclose(f);
+	 PCDrvFiles[a0] = NULL;
+	 v1 = 0;
+	}
+	break;
+
+  case 0x105:
+	if((f = PCDrvFile(a1)))
+	{
+	 std::vector<uint8> buf(a2);
+	 const size_t n = fread(buf.data(), 1, buf.size(), f);
+
+	 for(size_t i = 0; i < n; i++)
+	  PSX_MemPoke8((a3 + i) & 0x1FFFFFFF, buf[i]);
+	 v1 = n;
+	}
+	break;
+
+  case 0x106:
+	if((f = PCDrvFile(a1)))
+	{
+	 std::vector<uint8> buf(a2);
+
+	 for(size_t i = 0; i < buf.size(); i++)
+	  buf[i] = PSX_MemPeek8((a3 + i) & 0x1FFFFFFF);
+	 v1 = fwrite(buf.data(), 1, buf.size(), f);
+	}
+	break;
+
+  case 0x107:
+	if((f = PCDrvFile(a0)) && a3 <= 2 && !fseek(f, (int32)a2, a3 == 0 ? SEEK_SET : (a3 == 1 ? SEEK_CUR : SEEK_END)))
+	 v1 = ftell(f);
+	break;
+ }
+
+ gpr[2] = (v1 < 0) ? -1 : 0;
+ gpr[3] = v1;
+ return true;
+}
+
 // Remember to update MemPeek<>() and MemPoke<>() when we change address decoding in MemRW()
 template<typename T, bool IsWrite, bool Access24> static INLINE void MemRW(pscpu_timestamp_t &timestamp, uint32 A, uint32 &V)
 {
@@ -570,6 +695,24 @@ template<typename T, bool IsWrite, bool Access24> static INLINE void MemRW(pscpu
   // printf("HW Write%d: %08x %08x\n", (unsigned int)(sizeof(T)*8), (unsigned int)A, (unsigned int)V);
   //else
   // printf("HW Read%d: %08x\n", (unsigned int)(sizeof(T)*8), (unsigned int)A);
+
+  if(TestMode && A >= 0x1F802080 && A <= 0x1F802087)
+  {
+   if(IsWrite)
+   {
+    if(A == 0x1F802082)
+     TestExit(V);
+   }
+   else
+   {
+    static const uint8 sig[8] = { 'M', 'D', 'F', 'N', 0, 0, 0, 0 };
+
+    V = 0;
+    for(unsigned i = 0; i < (Access24 ? 3 : sizeof(T)); i++)
+     V |= sig[(A + i) & 7] << (i * 8);
+   }
+   return;
+  }
 
   if(A >= 0x1F801C00 && A <= 0x1F801FFF) // SPU
   {
@@ -1650,6 +1793,10 @@ static MDFN_COLD void InitCommon(std::vector<CDInterface*> *CDInterfaces, const 
  psx_dbg_mask = MDFN_GetSettingMultiM("psx.dbg_mask") | PSX_DBG_ERROR;
 #endif
 
+ TestMode = MDFN_GetSettingB("psx.dbg_testmode");
+ PCDrvBase = MDFN_GetSettingS("psx.dbg_pcdrv_base");
+ PSX_PCDrvEnabled = PCDrvBase != "";
+
  cdifs = CDInterfaces;
  region = CalcDiscSCEx();
  if(MDFN_GetSettingB("psx.cd_sanity"))
@@ -2103,6 +2250,7 @@ static MDFN_COLD void LoadCD(std::vector<CDInterface*> *CDInterfaces)
 
 static MDFN_COLD void Cleanup(void)
 {
+ PCDrvCloseAll();
  TextMem.resize(0);
 
  if(psf_loader)
@@ -2394,6 +2542,8 @@ static const MDFNSetting PSXSettings[] =
  { "psx.dbg_mask", MDFNSF_NOFLAGS, gettext_noop("Enable debug messages."), NULL, MDFNST_MULTI_ENUM, "none", NULL, NULL, NULL, NULL,  DBGMask_List },
 #endif
 
+ { "psx.dbg_testmode", MDFNSF_SUPPRESS_DOC, gettext_noop("Expose the test-mode registers at 0x1F802080."), gettext_noop("Reads return \"MDFN\"; a write to 0x1F802082 exits the emulator with the written value as its exit code."), MDFNST_BOOL, "0" },
+ { "psx.dbg_pcdrv_base", MDFNSF_SUPPRESS_DOC, gettext_noop("Serve PCDrv break calls from this host directory."), gettext_noop("Empty disables PCDrv."), MDFNST_STRING, "" },
  { "psx.dbg_exe_cdpath", MDFNSF_SUPPRESS_DOC | MDFNSF_CAT_PATH, gettext_noop("CD image to use with .PSX/.EXE loading."), NULL, MDFNST_STRING, "" },
 
  { NULL },
