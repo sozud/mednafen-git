@@ -108,6 +108,7 @@ namespace MDFN_IEN_PSX
 
  void PSX_RequestMLExit(void);
  MDFN_HIDE extern bool PSX_PCDrvEnabled;
+ MDFN_HIDE extern uint32 PSX_ShellHookPC;
  bool PSX_PCDrv(uint32 code, uint32* gpr);
  void ForceEventUpdates(const pscpu_timestamp_t timestamp);
 

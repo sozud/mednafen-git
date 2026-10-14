@@ -508,6 +508,7 @@ void PSX_RequestMLExit(void)
 //
 
 bool PSX_PCDrvEnabled = false;
+uint32 PSX_ShellHookPC = ~0U;
 static bool TestMode = false;
 static std::string PCDrvBase;
 static FILE* PCDrvFiles[32];
@@ -1287,7 +1288,7 @@ static void Emulate(EmulateSpecStruct *espec)
  SPU->StartFrame(espec->SoundRate, MDFN_GetSettingUI("psx.spu.resamp_quality"));
 
  Running = -1;
- timestamp = CPU->Run(timestamp, psf_loader == NULL && (psx_dbg_mask & PSX_DBG_BIOS_PRINT), psf_loader != NULL);
+ timestamp = CPU->Run(timestamp, psf_loader == NULL && ((psx_dbg_mask & PSX_DBG_BIOS_PRINT) || PSX_ShellHookPC != ~0U), psf_loader != NULL);
 
  assert(timestamp);
 
@@ -2045,7 +2046,10 @@ static MDFN_COLD void LoadEXE(Stream* fp, bool ignore_pcsp = false)
  //
 
  // BIOS patch
- BIOSROM->WriteU32(0x6990, (3 << 26) | ((0xBF001000 >> 2) & ((1 << 26) - 1)));
+ if(MDFN_GetSettingB("psx.dbg_exe_shellhook"))
+  PSX_ShellHookPC = 0x80030000;
+ else
+  BIOSROM->WriteU32(0x6990, (3 << 26) | ((0xBF001000 >> 2) & ((1 << 26) - 1)));
 // BIOSROM->WriteU32(0x691C, (3 << 26) | ((0xBF001000 >> 2) & ((1 << 26) - 1)));
 
 // printf("INSN: 0x%08x\n", BIOSROM->ReadU32(0x6990));
@@ -2250,6 +2254,7 @@ static MDFN_COLD void LoadCD(std::vector<CDInterface*> *CDInterfaces)
 
 static MDFN_COLD void Cleanup(void)
 {
+ PSX_ShellHookPC = ~0U;
  PCDrvCloseAll();
  TextMem.resize(0);
 
@@ -2543,6 +2548,7 @@ static const MDFNSetting PSXSettings[] =
 #endif
 
  { "psx.dbg_testmode", MDFNSF_SUPPRESS_DOC, gettext_noop("Expose the test-mode registers at 0x1F802080."), gettext_noop("Reads return \"MDFN\"; a write to 0x1F802082 exits the emulator with the written value as its exit code."), MDFNST_BOOL, "0" },
+ { "psx.dbg_exe_shellhook", MDFNSF_SUPPRESS_DOC, gettext_noop("Boot .EXE files where the BIOS enters the shell at 0x80030000."), gettext_noop("Instead of patching the BIOS ROM, which only works with Sony BIOS images, so that OpenBIOS can run .EXE files too."), MDFNST_BOOL, "0" },
  { "psx.dbg_pcdrv_base", MDFNSF_SUPPRESS_DOC, gettext_noop("Serve PCDrv break calls from this host directory."), gettext_noop("Empty disables PCDrv."), MDFNST_STRING, "" },
  { "psx.dbg_exe_cdpath", MDFNSF_SUPPRESS_DOC | MDFNSF_CAT_PATH, gettext_noop("CD image to use with .PSX/.EXE loading."), NULL, MDFNST_STRING, "" },
 

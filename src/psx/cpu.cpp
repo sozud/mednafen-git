@@ -643,6 +643,13 @@ pscpu_timestamp_t PS_CPU::RunReal(pscpu_timestamp_t timestamp_in)
 
    if(BIOSPrintMode)
    {
+    if(MDFN_UNLIKELY(PC == PSX_ShellHookPC))
+    {
+     PSX_ShellHookPC = ~0U;
+     PC = 0xBF001000;
+     new_PC = PC + 4;
+    }
+
     if(MDFN_UNLIKELY(!(PC & 0xFFFFFF00)))
     {
      switch((PC << 8) | GPR[9])

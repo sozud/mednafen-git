@@ -1,0 +1,70 @@
+name: psyz release
+
+on:
+  push:
+    branches:
+      - psyz-testmode
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PCSX_REDUX_REF: e1b865f73d6eda2f30ca5d1276a536a347f5081c
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libsdl2-dev zlib1g-dev \
+            gcc-mipsel-linux-gnu g++-mipsel-linux-gnu binutils-mipsel-linux-gnu
+      - name: Clone repo
+        uses: actions/checkout@v4
+      - name: Build mednafen
+        run: |
+          touch aclocal.m4 && sleep 1 && touch configure
+          find . -name Makefile.in -exec touch {} +
+          find . -name config.h.in -exec touch {} +
+          mkdir build && cd build
+          ../configure --disable-nls --disable-cjk-fonts --disable-fancy-scalers \
+            --disable-alsa --disable-jack --disable-apple2 --disable-gb --disable-gba \
+            --disable-lynx --disable-md --disable-nes --disable-ngp --disable-pce \
+            --disable-pce-fast --disable-pcfx --enable-psx --disable-sasplay \
+            --disable-sms --disable-snes --disable-snes-faust --disable-ss \
+            --disable-ssfplay --disable-vb --disable-wswan --without-libflac
+          make -j$(nproc)
+      - name: Build OpenBIOS
+        run: |
+          git clone --filter=blob:none https://github.com/grumpycoders/pcsx-redux.git
+          cd pcsx-redux
+          git checkout "$PCSX_REDUX_REF"
+          git submodule update --init --depth 1 third_party/uC-sdk
+          make -C src/mips/openbios -j$(nproc) BUILD=Release
+      - name: Package
+        run: |
+          mkdir mednafen-psyz
+          cp build/src/mednafen pcsx-redux/src/mips/openbios/openbios.bin mednafen-psyz/
+          cp COPYING mednafen-psyz/COPYING.mednafen
+          strip mednafen-psyz/mednafen
+          cat > mednafen-psyz/README.txt <<EOF
+          mednafen: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}
+          openbios.bin: https://github.com/grumpycoders/pcsx-redux/tree/${PCSX_REDUX_REF}/src/mips/openbios
+          Needs libSDL2-2.0 at run time.
+          EOF
+          tar czf mednafen-psyz-linux-x86_64.tar.gz mednafen-psyz
+          sha256sum mednafen-psyz-linux-x86_64.tar.gz | tee mednafen-psyz-linux-x86_64.tar.gz.sha256
+      - name: Smoke test
+        run: |
+          ! ldd mednafen-psyz/mednafen | grep "not found"
+          test "$(stat -c %s mednafen-psyz/openbios.bin)" = 524288
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="psyz-${GITHUB_SHA::7}"
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Mednafen with psyz test mode and OpenBIOS, built from ${GITHUB_SHA}." \
+            mednafen-psyz-linux-x86_64.tar.gz mednafen-psyz-linux-x86_64.tar.gz.sha256
