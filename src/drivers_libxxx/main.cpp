@@ -99,6 +99,7 @@
 #define MMX4_FUNC_XA_POLL 0x800168D8U
 #define MMX4_FUNC_XA_POLL_END 0x800169D8U
 #define MMX4_XA_STREAM_STATE 0x80141BD4U
+#define MMX4_XA_PLAYING 0x80173C84U
 #define MMX4_FUNC_LOAD_COMMON_ARCHIVES 0x80012E38U
 #define MMX4_FUNC_LOAD_PLAYER_ARCHIVES 0x80012EB8U
 #define MMX4_FUNC_LOAD_SCENE_ARCHIVE 0x80013014U
@@ -880,9 +881,14 @@ static uint32 replay_cd_read_sample;
 static uint32 replay_cd_read_pending;
 static uint32 replay_xa_stops;
 static uint32 replay_xa_stop_sample;
+static uint32 replay_xa_starts;
+static uint32 replay_xa_start_sample;
+static uint8 replay_xa_previous_state;
 static bool replay_started;
 static bool replay_pad_clocked;
 static uint16 replay_buttons;
+static uint16 replay_events;
+static unsigned replay_sample_size = 2;
 static FILE* replay_normalized_file;
 static uint64 replay_normalized_frames;
 static FILE* replay_object_log;
@@ -976,15 +982,19 @@ static void load_replay(const char* path)
  if(std::fread(header, sizeof(header), 1, file) != 1)
   throw std::runtime_error("unable to read replay header");
  if(std::memcmp(header, "MMX4RPL1", 8) &&
-    std::memcmp(header, "MMX4RPL2", 8))
+    std::memcmp(header, "MMX4RPL2", 8) &&
+    std::memcmp(header, "MMX4RPL3", 8))
   throw std::runtime_error("invalid replay magic");
+ replay_sample_size = std::memcmp(header, "MMX4RPL3", 8) ? 2 : 4;
+ if((size - 16) % replay_sample_size)
+  throw std::runtime_error("truncated replay");
  if(header[12] > 2 || header[13] > 10 || header[14] || header[15])
   throw std::runtime_error("invalid replay header values");
  replay_loadout = header[12];
  replay_story = header[13];
  std::memcpy(replay_scene, header + 8, sizeof(replay_scene));
- replay_pad_clocked = !std::memcmp(header, "MMX4RPL2", 8);
- replay_length = uint64(size - 16) / 2;
+ replay_pad_clocked = std::memcmp(header, "MMX4RPL1", 8) != 0;
+ replay_length = uint64(size - 16) / replay_sample_size;
  replay_input_file = file;
  replay_active = true;
  std::printf("oracle: replay %s: %llu %s samples, stage %u-%u, checkpoint %u, character %u\n",
@@ -1006,14 +1016,30 @@ static bool replay_begin()
  return true;
 }
 
+static void replay_apply_events()
+{
+ if(!(replay_events & 1)) return;
+ const uint32 boss = peek32(MMX4_ENGINE_OBJ + 0x20);
+ if(peek8(MMX4_ENGINE_OBJ) != 6 || !peek8(MMX4_ENGINE_OBJ + 0x24) ||
+    (boss & 0xFFE00000U) != 0x80000000U || !peek8(boss))
+ {
+  std::printf("frame %u: replay event boss-hp-1 ignored, no active boss\n", frame_number);
+  return;
+ }
+ poke8(boss + 0x5C, 1);
+ std::printf("frame %u: replay event boss-hp-1 applied to %08x\n", frame_number, boss);
+}
+
 static void replay_advance_sample()
 {
  replay_buttons = 0;
+ replay_events = 0;
  if(replay_consumed >= replay_length) return;
- uint8 raw[2];
- if(std::fread(raw, sizeof(raw), 1, replay_input_file) != 1)
+ uint8 raw[4] = {};
+ if(std::fread(raw, replay_sample_size, 1, replay_input_file) != 1)
   throw std::runtime_error("replay input stream ended unexpectedly");
  replay_buttons = uint16(raw[0] | (raw[1] << 8));
+ replay_events = uint16(raw[2] | (raw[3] << 8));
  replay_consumed++;
  if(replay_consumed == replay_length)
   std::printf("frame %u: replay finished after %llu inputs\n", frame_number,
@@ -1063,6 +1089,8 @@ static void replay_supply_input()
  poke8(MMX4_PAD_BUFFER + 1, 0x41);
  poke8(MMX4_PAD_BUFFER + 2, uint8(~replay_buttons >> 8));
  poke8(MMX4_PAD_BUFFER + 3, uint8(~replay_buttons));
+ if(replay_pad_clocked)
+  replay_apply_events();
 }
 
 static void open_replay_logs()
@@ -1089,7 +1117,8 @@ static void open_replay_logs()
   "frame\tgame\tengine\tstate\tstage\tsubstage\tcheckpoint\tcharacter\t"
   "rng\tpad\tpad_prev\thealth\tplayer_x\tplayer_y\tbg0_x\tbg0_y\tphase\t"
   "cd_state\tcd_pending\thud\tboss\ttransition\tentity_intro\t"
-  "player_health\tcd_reads\tcd_read_sample\tcd_read_pending\txa_stops\txa_stop_sample\n");
+  "player_health\tcd_reads\tcd_read_sample\tcd_read_pending\txa_stops\txa_stop_sample\t"
+  "xa_starts\txa_start_sample\n");
  std::fprintf(replay_extension_log,
   "frame\tgame\tengine\ttable\tslot\tid\text80_value\text84_value\t"
   "ext88\text89\text8a\text8b\text8c\n");
@@ -1138,7 +1167,7 @@ static void dump_replay_frame()
  const uint32 game = peek32(MMX4_GAME_INFO);
  const uint32 engine = peek32(MMX4_ENGINE_OBJ);
  std::fprintf(replay_frame_log,
-  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%u\t%u\t%u\n",
+  "%ld\t%08x\t%08x\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%u\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
   frame, game, engine, int(int8(peek8(MMX4_ENGINE_OBJ))),
   int(int8(peek8(MMX4_ENGINE_STAGE))), int(int8(peek8(MMX4_ENGINE_SUBSTAGE))),
   int(int8(peek8(MMX4_ENGINE_CHECKPOINT))),
@@ -1158,7 +1187,8 @@ static void dump_replay_frame()
   unsigned(peek8(MMX4_PLAYER + 0x5C)), unsigned(replay_cd_reads),
   unsigned(replay_cd_read_sample), unsigned(replay_cd_read_pending),
   unsigned(replay_xa_stops),
-  unsigned(replay_xa_stop_sample));
+  unsigned(replay_xa_stop_sample), unsigned(replay_xa_starts),
+  unsigned(replay_xa_start_sample));
 
  for(const auto& table : replay_tables)
   for(uint32 slot = 0; slot < table.count; slot++)
@@ -1443,6 +1473,16 @@ static void cpu_hook(uint32 pc, bool)
    std::fflush(stdout);
   }
   probe_hits++;
+ }
+ if(pc == MMX4_FUNC_READ_PAD)
+ {
+  const uint8 xa_state = peek8(MMX4_XA_PLAYING);
+  if(xa_state == 2 && replay_xa_previous_state != 2)
+  {
+   replay_xa_starts++;
+   replay_xa_start_sample = uint32(replay_consumed);
+  }
+  replay_xa_previous_state = xa_state;
  }
  if(pc == MMX4_FUNC_READ_PAD && replay_active)
   replay_supply_input();
